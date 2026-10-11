@@ -50,11 +50,6 @@ const navigation = [
     icon: Package,
   },
   {
-    label: "Approvals",
-    href: "/admin/approvals",
-    icon: FileText,
-  },
-  {
     label: "Finance",
     href: "/admin/finance",
     icon: WalletCards,

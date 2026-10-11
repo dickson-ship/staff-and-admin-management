@@ -41,7 +41,7 @@ export default function AdminHeader() {
         </p>
 
         <h1 className="text-lg font-bold text-[#172033]">
-          Welcome back, {firstName}
+          Welcome back, {profile?.name || firstName}
         </h1>
       </div>
 

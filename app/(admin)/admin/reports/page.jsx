@@ -1,4 +1,3 @@
-
 "use client";
 
 import { useEffect, useMemo, useState } from "react";
@@ -43,6 +42,44 @@ const INITIAL_DATA = {
   submissions: [],
 };
 
+const SETTLED_ADVANCE_STATUSES = new Set([
+  "paid",
+  "disbursed",
+  "issued",
+  "released",
+  "completed",
+  "complete",
+]);
+
+const VALID_PAYMENT_STATUSES = new Set([
+  "paid",
+  "completed",
+  "complete",
+  "recorded",
+  "confirmed",
+  "successful",
+  "success",
+  "disbursed",
+]);
+
+const INVALID_TRANSACTION_STATUSES = new Set([
+  "void",
+  "voided",
+  "cancelled",
+  "canceled",
+  "rejected",
+  "declined",
+]);
+
+const PENDING_PAYMENT_STATUSES = new Set([
+  "pending",
+  "processing",
+  "draft",
+  "unpaid",
+  "awaiting-payment",
+  "awaiting-approval",
+]);
+
 const currency = (value) =>
   new Intl.NumberFormat("en-GH", {
     style: "currency",
@@ -82,15 +119,12 @@ function formatDate(value) {
     : "—";
 }
 
-function personName(worker) {
-  if (!worker) return "Unknown worker";
-
-  return (
-    worker.name ||
-    `${worker.firstName || ""} ${worker.lastName || ""}`.trim() ||
-    worker.email ||
-    "Unknown worker"
-  );
+function normalizeStatus(value) {
+  return String(value || "unknown")
+    .trim()
+    .toLowerCase()
+    .replaceAll("_", "-")
+    .replaceAll(" ", "-");
 }
 
 function statusLabel(value) {
@@ -100,8 +134,19 @@ function statusLabel(value) {
     .replace(/\b\w/g, (character) => character.toUpperCase());
 }
 
+function personName(worker) {
+  if (!worker) return "Unknown worker";
+
+  return (
+    worker.name ||
+    `${worker.firstName || ""} ${worker.lastName || ""}`.trim() ||
+    worker.fullName ||
+    worker.email ||
+    "Unknown worker"
+  );
+}
+
 function inPeriod(value, start, end) {
-  // With no date filter, include records even if their date is missing.
   if (!start && !end) return true;
 
   const date = toDate(value);
@@ -118,6 +163,429 @@ function inPeriod(value, start, end) {
   }
 
   return true;
+}
+
+function amountOf(record, ...fields) {
+  for (const field of fields) {
+    const value = record?.[field];
+
+    if (value !== undefined && value !== null && value !== "") {
+      const amount = Number(value);
+      return Number.isFinite(amount) ? amount : 0;
+    }
+  }
+
+  return 0;
+}
+
+function isInvalidTransaction(record) {
+  const status = normalizeStatus(record?.status);
+  return INVALID_TRANSACTION_STATUSES.has(status);
+}
+
+/**
+ * An approved request is not necessarily money that has been issued.
+ *
+ * This checks common fields so the report can support existing documents
+ * that already track disbursement in different ways.
+ *
+ * To count an advance, use a settled status such as "disbursed" or set
+ * disbursedAt / issuedAt / paidAt when the money is actually handed over.
+ */
+function isRequestDisbursed(request) {
+  if (!request) return false;
+
+  if (
+    request.isDisbursed === true ||
+    request.disbursed === true ||
+    request.isPaid === true ||
+    request.paid === true
+  ) {
+    return true;
+  }
+
+  const statusFields = [
+    request.disbursementStatus,
+    request.payoutStatus,
+    request.paymentStatus,
+    request.status,
+  ];
+
+  if (
+    statusFields.some((value) =>
+      SETTLED_ADVANCE_STATUSES.has(normalizeStatus(value))
+    )
+  ) {
+    return true;
+  }
+
+  return Boolean(
+    request.disbursedAt ||
+      request.issuedAt ||
+      request.paidAt ||
+      request.releasedAt
+  );
+}
+
+function requestDisplayStatus(request) {
+  if (isRequestDisbursed(request)) return "Disbursed";
+
+  if (normalizeStatus(request?.status) === "approved") {
+    return "Approved — not issued";
+  }
+
+  return statusLabel(request?.status);
+}
+
+/**
+ * Recorded payments with no status are treated as valid because the
+ * workerPayments collection is used for payments actually recorded by admin.
+ *
+ * Explicit pending, draft, void, rejected or cancelled payments are not
+ * deducted from the outstanding salary balance.
+ */
+function isPaymentCountable(payment) {
+  if (!payment || isInvalidTransaction(payment)) return false;
+
+  const status = normalizeStatus(payment.status);
+
+  if (PENDING_PAYMENT_STATUSES.has(status)) return false;
+
+  if (!payment.status) return true;
+
+  return VALID_PAYMENT_STATUSES.has(status);
+}
+
+function isExpenseCountable(expense) {
+  return Boolean(expense) && !isInvalidTransaction(expense);
+}
+
+function personRecordWorkerId(record, assignmentMap) {
+  if (record?.workerId) return record.workerId;
+  if (record?.staffId) return record.staffId;
+
+  const assignmentId = record?.assignmentId;
+  if (assignmentId) {
+    return assignmentMap.get(assignmentId)?.workerId || null;
+  }
+
+  return null;
+}
+
+function projectIdForAssignment(assignment, projectMap) {
+  if (!assignment) return null;
+
+  const directProjectId =
+    assignment.projectId || assignment.projectID || assignment.jobId;
+
+  if (directProjectId) return directProjectId;
+
+  const project = projectMap.get(assignment.projectRef);
+  return project?.id || null;
+}
+
+function projectIdForSalary(salary, assignmentMap, projectMap) {
+  if (salary?.projectId || salary?.projectID || salary?.jobId) {
+    return salary.projectId || salary.projectID || salary.jobId;
+  }
+
+  const assignment = assignmentMap.get(salary?.assignmentId);
+  return projectIdForAssignment(assignment, projectMap);
+}
+
+function projectIdForRecord(record, assignmentMap, projectMap) {
+  const directProjectId =
+    record?.projectId || record?.projectID || record?.jobId;
+
+  if (directProjectId) return directProjectId;
+
+  const assignment = assignmentMap.get(record?.assignmentId);
+  return projectIdForAssignment(assignment, projectMap);
+}
+
+function salaryAmount(salary) {
+  return amountOf(salary, "agreedSalary", "salaryAmount", "amount", "salary");
+}
+
+/**
+ * Determines whether an advance, payment or expense belongs to one salary
+ * record.
+ *
+ * Direct salaryId matches take priority. Assignment matches are next.
+ * If only a project is available, the record is attributed only when there
+ * is one matching assignment and one matching salary record for that worker
+ * and project. This avoids assigning one transaction to multiple jobs.
+ */
+function recordMatchesSalary(record, salary, context) {
+  const {
+    salaries,
+    assignments,
+    assignmentMap,
+    projectMap,
+  } = context;
+
+  if (!record || !salary) return false;
+
+  if (
+    record.salaryId &&
+    String(record.salaryId) !== String(salary.id)
+  ) {
+    return false;
+  }
+
+  const recordAssignmentId = record.assignmentId || null;
+  const salaryAssignmentId = salary.assignmentId || null;
+
+  const recordWorkerId = personRecordWorkerId(record, assignmentMap);
+
+  if (
+    recordWorkerId &&
+    salary.workerId &&
+    String(recordWorkerId) !== String(salary.workerId)
+  ) {
+    return false;
+  }
+
+  if (
+    record.workerId &&
+    salary.workerId &&
+    String(record.workerId) !== String(salary.workerId)
+  ) {
+    return false;
+  }
+
+  if (recordAssignmentId && salaryAssignmentId) {
+    return (
+      String(recordAssignmentId) === String(salaryAssignmentId) &&
+      (!recordWorkerId ||
+        String(recordWorkerId) === String(salary.workerId))
+    );
+  }
+
+  const salaryProjectId = projectIdForSalary(
+    salary,
+    assignmentMap,
+    projectMap
+  );
+
+  const recordProjectId = projectIdForRecord(
+    record,
+    assignmentMap,
+    projectMap
+  );
+
+  if (
+    !salaryProjectId ||
+    !recordProjectId ||
+    String(salaryProjectId) !== String(recordProjectId)
+  ) {
+    return false;
+  }
+
+  if (
+    recordWorkerId &&
+    salary.workerId &&
+    String(recordWorkerId) !== String(salary.workerId)
+  ) {
+    return false;
+  }
+
+  const assignmentsForProject = assignments.filter((assignment) => {
+    const assignmentProjectId = projectIdForAssignment(
+      assignment,
+      projectMap
+    );
+
+    return (
+      String(assignment.workerId || "") === String(salary.workerId || "") &&
+      String(assignmentProjectId || "") === String(salaryProjectId)
+    );
+  });
+
+  const salariesForProject = salaries.filter((item) => {
+    const itemProjectId = projectIdForSalary(
+      item,
+      assignmentMap,
+      projectMap
+    );
+
+    return (
+      String(item.workerId || "") === String(salary.workerId || "") &&
+      String(itemProjectId || "") === String(salaryProjectId)
+    );
+  });
+
+  if (
+    assignmentsForProject.length !== 1 ||
+    salariesForProject.length !== 1
+  ) {
+    return false;
+  }
+
+  if (recordAssignmentId) {
+    return (
+      String(assignmentsForProject[0].id) ===
+      String(recordAssignmentId)
+    );
+  }
+
+  return true;
+}
+
+/**
+ * Avoid deducting the same amount twice when an issued money request also
+ * has an expense record documenting that same advance.
+ *
+ * If an expense is explicitly linked to a disbursed request, the request is
+ * counted as the advance and that duplicate expense is excluded.
+ */
+function expenseLinkedRequestId(expense) {
+  return (
+    expense.moneyRequestId ||
+    expense.requestId ||
+    expense.sourceRequestId ||
+    expense.advanceRequestId ||
+    expense.relatedRequestId ||
+    null
+  );
+}
+
+function isSalaryDeductibleExpense(expense, issuedRequestIds) {
+  if (!isExpenseCountable(expense)) return false;
+
+  const linkedRequestId = expenseLinkedRequestId(expense);
+
+  if (
+    linkedRequestId &&
+    issuedRequestIds.has(String(linkedRequestId))
+  ) {
+    return false;
+  }
+
+  const categoryText = [
+    expense.category,
+    expense.type,
+    expense.expenseType,
+    expense.sourceType,
+    expense.transactionType,
+  ]
+    .filter(Boolean)
+    .join(" ")
+    .toLowerCase()
+    .replaceAll("_", " ")
+    .replaceAll("-", " ");
+
+  // Advance/request entries should be counted from the request record,
+  // rather than being deducted a second time as an expense.
+  if (
+    /\badvance\b/.test(categoryText) ||
+    /\bmoney request\b/.test(categoryText) ||
+    /\bcash request\b/.test(categoryText)
+  ) {
+    return false;
+  }
+
+  // Honour an explicit admin decision where present.
+  const deductionFlags = [
+    expense.salaryDeductible,
+    expense.deductFromSalary,
+    expense.chargeToWorker,
+    expense.deductible,
+  ];
+
+  const explicitFlag = deductionFlags.find(
+    (value) => typeof value === "boolean"
+  );
+
+  if (typeof explicitFlag === "boolean") {
+    return explicitFlag;
+  }
+
+  // Default: ordinary expenses linked to the worker's job are deductible.
+  return true;
+}
+
+/**
+ * Calculates one salary row using all available history, regardless of
+ * the selected activity date filter.
+ */
+function calculateSalaryRow(salary, context) {
+  const {
+    requests,
+    expenses,
+    payments,
+    assignmentMap,
+    projectMap,
+  } = context;
+
+  const salaryProjectId = projectIdForSalary(
+    salary,
+    assignmentMap,
+    projectMap
+  );
+
+  const matchingAssignments = context.assignments.filter((assignment) => {
+    return (
+      String(assignment.workerId || "") === String(salary.workerId || "") &&
+      String(
+        projectIdForAssignment(assignment, projectMap) || ""
+      ) === String(salaryProjectId || "")
+    );
+  });
+
+  const issuedRequests = requests.filter(
+    (request) =>
+      isRequestDisbursed(request) &&
+      recordMatchesSalary(request, salary, context)
+  );
+
+  const advances = issuedRequests.reduce(
+    (sum, request) => sum + amountOf(request, "amount", "requestedAmount"),
+    0
+  );
+
+  const issuedRequestIds = new Set(
+    issuedRequests.map((request) => String(request.id))
+  );
+
+  const deductibleExpenses = expenses.filter((expense) => {
+    if (!isExpenseCountable(expense)) return false;
+
+    if (!recordMatchesSalary(expense, salary, context)) return false;
+
+    return isSalaryDeductibleExpense(expense, issuedRequestIds);
+  });
+
+  const expensesDeducted = deductibleExpenses.reduce(
+    (sum, expense) => sum + amountOf(expense, "amount", "total"),
+    0
+  );
+
+  const validPayments = payments.filter(
+    (payment) =>
+      isPaymentCountable(payment) &&
+      recordMatchesSalary(payment, salary, context)
+  );
+
+  const paid = validPayments.reduce(
+    (sum, payment) =>
+      sum + amountOf(payment, "amount", "paidAmount", "paymentAmount"),
+    0
+  );
+
+  const agreedSalary = salaryAmount(salary);
+
+  return {
+    ...salary,
+    projectId: salaryProjectId,
+    project: projectMap.get(salaryProjectId),
+    agreedSalary,
+    advances,
+    expensesDeducted,
+    paid,
+    balance: agreedSalary - advances - expensesDeducted - paid,
+    matchingAssignments,
+  };
 }
 
 function StatCard({ icon: Icon, label, value, note }) {
@@ -152,30 +620,52 @@ function Panel({ title, description, children }) {
           </p>
         )}
       </div>
+
       {children}
     </section>
   );
 }
 
 function StatusBadge({ value }) {
-  const normalized = String(value || "unknown")
-    .toLowerCase()
-    .replaceAll("_", "-");
+  const normalized = normalizeStatus(value);
 
   let color = "bg-gray-100 text-gray-800";
 
   if (
-    ["approved", "completed", "active", "paid", "accepted"].includes(
-      normalized
-    )
+    [
+      "approved",
+      "completed",
+      "complete",
+      "active",
+      "paid",
+      "accepted",
+      "disbursed",
+      "recorded",
+      "confirmed",
+      "successful",
+    ].includes(normalized)
   ) {
     color = "bg-emerald-100 text-emerald-800";
   } else if (
-    ["pending", "assigned", "in-progress", "submitted"].includes(normalized)
+    [
+      "pending",
+      "assigned",
+      "in-progress",
+      "submitted",
+      "processing",
+      "approved-not-issued",
+    ].includes(normalized)
   ) {
     color = "bg-amber-100 text-amber-900";
   } else if (
-    ["rejected", "cancelled", "declined", "void"].includes(normalized)
+    [
+      "rejected",
+      "cancelled",
+      "canceled",
+      "declined",
+      "void",
+      "voided",
+    ].includes(normalized)
   ) {
     color = "bg-red-100 text-red-800";
   }
@@ -189,8 +679,13 @@ function StatusBadge({ value }) {
   );
 }
 
-function ReportTable({ headers, children, emptyMessage = "No records found." }) {
-  const isEmpty = !children || (Array.isArray(children) && children.length === 0);
+function ReportTable({
+  headers,
+  children,
+  emptyMessage = "No records found.",
+}) {
+  const isEmpty =
+    !children || (Array.isArray(children) && children.length === 0);
 
   return (
     <div className="overflow-x-auto">
@@ -259,13 +754,16 @@ export default function AdminReportsPage() {
     setError("");
 
     const firstSnapshots = new Set();
+    const errors = new Map();
     const unsubscribers = [];
-    let failed = false;
+    let active = true;
 
     for (const [key, collectionName] of REPORT_SOURCES) {
       const unsubscribe = onSnapshot(
         collection(db, collectionName),
         (snapshot) => {
+          if (!active) return;
+
           setData((current) => ({
             ...current,
             [key]: snapshot.docs.map((item) => ({
@@ -275,28 +773,43 @@ export default function AdminReportsPage() {
           }));
 
           firstSnapshots.add(key);
+          errors.delete(collectionName);
 
-          if (firstSnapshots.size === REPORT_SOURCES.length && !failed) {
+          if (firstSnapshots.size === REPORT_SOURCES.length) {
             setLoading(false);
+          }
+
+          if (errors.size === 0) {
+            setError("");
           }
         },
         (err) => {
-          console.error(`Report loading error (${collectionName}):`, err);
-          failed = true;
-          setLoading(false);
+          if (!active) return;
 
-          setError(
+          console.error(
+            `Report loading error (${collectionName}):`,
+            err
+          );
+
+          errors.set(
+            collectionName,
             err.code === "permission-denied"
               ? `Access denied to "${collectionName}". Check the Firestore security rules.`
               : `Unable to load "${collectionName}". Some report figures may be incomplete.`
           );
+
+          setError([...errors.values()].join(" "));
+          setLoading(false);
         }
       );
 
       unsubscribers.push(unsubscribe);
     }
 
-    return () => unsubscribers.forEach((unsubscribe) => unsubscribe());
+    return () => {
+      active = false;
+      unsubscribers.forEach((unsubscribe) => unsubscribe());
+    };
   }, [user, profile?.role, authLoading]);
 
   const workerMap = useMemo(
@@ -310,7 +823,13 @@ export default function AdminReportsPage() {
   );
 
   const assignmentMap = useMemo(
-    () => new Map(data.assignments.map((item) => [item.id, item])),
+    () =>
+      new Map(
+        data.assignments.map((assignment) => [
+          assignment.id,
+          assignment,
+        ])
+      ),
     [data.assignments]
   );
 
@@ -336,14 +855,57 @@ export default function AdminReportsPage() {
       .sort((a, b) => personName(a).localeCompare(personName(b)));
   }, [data.workers, search]);
 
-  // Assignment dates are filtered by creation date, or start date if
-  // creation date is not available.
+  const salaryCalculationContext = useMemo(
+    () => ({
+      salaries: data.salaries,
+      requests: data.requests,
+      expenses: data.expenses,
+      payments: data.payments,
+      assignments: data.assignments,
+      assignmentMap,
+      projectMap,
+    }),
+    [
+      data.salaries,
+      data.requests,
+      data.expenses,
+      data.payments,
+      data.assignments,
+      assignmentMap,
+      projectMap,
+    ]
+  );
+
+  // Calculate each salary consistently so the overview and individual report
+  // always use the same matching and deduction rules.
+  const allSalaryRows = useMemo(
+    () =>
+      data.salaries.map((salary) =>
+        calculateSalaryRow(salary, salaryCalculationContext)
+      ),
+    [data.salaries, salaryCalculationContext]
+  );
+
+  const workerSalaries = useMemo(
+    () =>
+      allSalaryRows.filter(
+        (salary) => salary.workerId === selectedWorkerId
+      ),
+    [allSalaryRows, selectedWorkerId]
+  );
+
+  // Activity tables use the selected date filter. Salary balances above use
+  // the worker's full salary history.
   const workerAssignments = useMemo(
     () =>
       data.assignments.filter(
         (item) =>
           item.workerId === selectedWorkerId &&
-          inPeriod(item.createdAt || item.startDate, startDate, endDate)
+          inPeriod(
+            item.createdAt || item.startDate,
+            startDate,
+            endDate
+          )
       ),
     [data.assignments, selectedWorkerId, startDate, endDate]
   );
@@ -353,7 +915,11 @@ export default function AdminReportsPage() {
       data.requests.filter(
         (item) =>
           item.workerId === selectedWorkerId &&
-          inPeriod(item.createdAt, startDate, endDate)
+          inPeriod(
+            item.createdAt || item.requestedAt,
+            startDate,
+            endDate
+          )
       ),
     [data.requests, selectedWorkerId, startDate, endDate]
   );
@@ -362,22 +928,42 @@ export default function AdminReportsPage() {
     () =>
       data.expenses.filter(
         (item) =>
-          item.workerId === selectedWorkerId &&
-          item.status !== "void" &&
-          inPeriod(item.createdAt || item.expenseDate, startDate, endDate)
+          personRecordWorkerId(item, assignmentMap) === selectedWorkerId &&
+          isExpenseCountable(item) &&
+          inPeriod(
+            item.createdAt || item.expenseDate,
+            startDate,
+            endDate
+          )
       ),
-    [data.expenses, selectedWorkerId, startDate, endDate]
+    [
+      data.expenses,
+      assignmentMap,
+      selectedWorkerId,
+      startDate,
+      endDate,
+    ]
   );
 
   const workerPayments = useMemo(
     () =>
       data.payments.filter(
         (item) =>
-          item.workerId === selectedWorkerId &&
-          item.status !== "void" &&
-          inPeriod(item.paymentDate || item.createdAt, startDate, endDate)
+          personRecordWorkerId(item, assignmentMap) === selectedWorkerId &&
+          !isInvalidTransaction(item) &&
+          inPeriod(
+            item.paymentDate || item.createdAt,
+            startDate,
+            endDate
+          )
       ),
-    [data.payments, selectedWorkerId, startDate, endDate]
+    [
+      data.payments,
+      assignmentMap,
+      selectedWorkerId,
+      startDate,
+      endDate,
+    ]
   );
 
   const workerSubmissions = useMemo(
@@ -385,87 +971,18 @@ export default function AdminReportsPage() {
       data.submissions.filter(
         (item) =>
           item.workerId === selectedWorkerId &&
-          inPeriod(item.createdAt || item.submittedAt, startDate, endDate)
+          inPeriod(
+            item.createdAt || item.submittedAt,
+            startDate,
+            endDate
+          )
       ),
     [data.submissions, selectedWorkerId, startDate, endDate]
   );
 
-  // Salary balances use all approved advances and all valid linked payments.
-  // The date filters do not change the current amount owed.
-  const workerSalaries = useMemo(() => {
-    return data.salaries
-      .filter((salary) => {
-        if (salary.workerId !== selectedWorkerId) return false;
-
-        const assignment = assignmentMap.get(salary.assignmentId);
-        const projectId = salary.projectId || assignment?.projectId;
-
-        return true;
-      })
-      .map((salary) => {
-        const salaryAssignment = assignmentMap.get(salary.assignmentId);
-        const salaryProjectId =
-          salary.projectId || salaryAssignment?.projectId;
-
-        const matchingAssignments = data.assignments.filter(
-          (assignment) =>
-            assignment.workerId === salary.workerId &&
-            assignment.projectId === salaryProjectId
-        );
-
-        const advances = data.requests
-          .filter((request) => {
-            if (
-              request.workerId !== salary.workerId ||
-              request.status !== "approved"
-            ) {
-              return false;
-            }
-
-            if (request.assignmentId) {
-              return request.assignmentId === salary.assignmentId;
-            }
-
-            // Legacy requests can only be attributed safely when a
-            // worker has exactly one assignment for the relevant project.
-            return (
-              matchingAssignments.length === 1 &&
-              request.projectId === salaryProjectId
-            );
-          })
-          .reduce((sum, request) => sum + Number(request.amount || 0), 0);
-
-        const paid = data.payments
-          .filter(
-            (payment) =>
-              payment.salaryId === salary.id &&
-              payment.workerId === salary.workerId &&
-              payment.status !== "void"
-          )
-          .reduce((sum, payment) => sum + Number(payment.amount || 0), 0);
-
-        return {
-          ...salary,
-          projectId: salaryProjectId,
-          project: projectMap.get(salaryProjectId),
-          advances,
-          paid,
-          balance: Number(salary.agreedSalary || 0) - advances - paid,
-        };
-      });
-  }, [
-    data.salaries,
-    data.requests,
-    data.payments,
-    data.assignments,
-    selectedWorkerId,
-    assignmentMap,
-    projectMap,
-  ]);
-
   const totals = useMemo(() => {
     const salaryTotal = workerSalaries.reduce(
-      (sum, item) => sum + Number(item.agreedSalary || 0),
+      (sum, item) => sum + item.agreedSalary,
       0
     );
 
@@ -474,45 +991,54 @@ export default function AdminReportsPage() {
       0
     );
 
-    const paid = workerSalaries.reduce((sum, item) => sum + item.paid, 0);
+    const expensesDeducted = workerSalaries.reduce(
+      (sum, item) => sum + item.expensesDeducted,
+      0
+    );
+
+    const paid = workerSalaries.reduce(
+      (sum, item) => sum + item.paid,
+      0
+    );
 
     const balance = workerSalaries.reduce(
       (sum, item) => sum + item.balance,
       0
     );
 
-    const approvedRequests = workerRequests
-      .filter((item) => item.status === "approved")
-      .reduce((sum, item) => sum + Number(item.amount || 0), 0);
-
     const pendingRequests = workerRequests.filter(
-      (item) => item.status === "pending"
+      (item) => normalizeStatus(item.status) === "pending"
     ).length;
 
     const expenseTotal = workerExpenses.reduce(
-      (sum, item) => sum + Number(item.amount || 0),
+      (sum, item) => sum + amountOf(item, "amount", "total"),
       0
     );
 
     return {
       assignments: workerAssignments.length,
       completed: workerAssignments.filter(
-        (item) => item.status === "completed"
+        (item) => normalizeStatus(item.status) === "completed"
       ).length,
       inProgress: workerAssignments.filter((item) =>
-        ["in-progress", "in_progress"].includes(item.status)
+        ["in-progress", "in-progress"].includes(
+          normalizeStatus(item.status)
+        )
       ).length,
       pendingRequests,
-      approvedRequests,
-      expenseTotal,
       salaryTotal,
       advances,
+      expensesDeducted,
       paid,
       balance,
       submissions: workerSubmissions.length,
       pendingSubmissions: workerSubmissions.filter(
-        (item) => item.status === "pending"
+        (item) =>
+          ["pending", "submitted"].includes(
+            normalizeStatus(item.reviewStatus || item.status)
+          )
       ).length,
+      expenseTotal,
     };
   }, [
     workerSalaries,
@@ -524,103 +1050,103 @@ export default function AdminReportsPage() {
 
   const allWorkerSummaries = useMemo(() => {
     return visibleWorkers.map((worker) => {
-      const salaries = data.salaries.filter(
+      const salaries = allSalaryRows.filter(
         (salary) => salary.workerId === worker.id
       );
 
       const totalSalary = salaries.reduce(
-        (sum, salary) => sum + Number(salary.agreedSalary || 0),
+        (sum, salary) => sum + salary.agreedSalary,
         0
       );
 
-      const totalPaid = salaries.reduce((sum, salary) => {
-        return (
-          sum +
-          data.payments
-            .filter(
-              (payment) =>
-                payment.salaryId === salary.id &&
-                payment.workerId === worker.id &&
-                payment.status !== "void"
-            )
-            .reduce(
-              (paymentSum, payment) =>
-                paymentSum + Number(payment.amount || 0),
-              0
-            )
-        );
-      }, 0);
+      const advances = salaries.reduce(
+        (sum, salary) => sum + salary.advances,
+        0
+      );
 
-      const advances = salaries.reduce((sum, salary) => {
-        const projectId =
-          salary.projectId ||
-          assignmentMap.get(salary.assignmentId)?.projectId;
+      const expensesDeducted = salaries.reduce(
+        (sum, salary) => sum + salary.expensesDeducted,
+        0
+      );
 
-        const sameAssignments = data.assignments.filter(
-          (assignment) =>
-            assignment.workerId === worker.id &&
-            assignment.projectId === projectId
-        );
-
-        const allocated = data.requests
-          .filter((request) => {
-            if (
-              request.workerId !== worker.id ||
-              request.status !== "approved"
-            ) {
-              return false;
-            }
-
-            if (request.assignmentId) {
-              return request.assignmentId === salary.assignmentId;
-            }
-
-            return (
-              sameAssignments.length === 1 &&
-              request.projectId === projectId
-            );
-          })
-          .reduce((amount, request) => amount + Number(request.amount || 0), 0);
-
-        return sum + allocated;
-      }, 0);
+      const totalPaid = salaries.reduce(
+        (sum, salary) => sum + salary.paid,
+        0
+      );
 
       const assignmentCount = data.assignments.filter(
         (item) =>
           item.workerId === worker.id &&
-          inPeriod(item.createdAt || item.startDate, startDate, endDate)
+          inPeriod(
+            item.createdAt || item.startDate,
+            startDate,
+            endDate
+          )
       ).length;
 
       return {
         worker,
         salary: totalSalary,
         advances,
+        expensesDeducted,
         paid: totalPaid,
-        balance: totalSalary - advances - totalPaid,
+        balance: totalSalary - advances - expensesDeducted - totalPaid,
         assignments: assignmentCount,
       };
     });
   }, [
     visibleWorkers,
-    data.salaries,
-    data.payments,
-    data.requests,
+    allSalaryRows,
     data.assignments,
-    assignmentMap,
     startDate,
     endDate,
   ]);
 
+  const filteredAssignmentCount = useMemo(
+    () =>
+      data.assignments.filter((item) =>
+        inPeriod(
+          item.createdAt || item.startDate,
+          startDate,
+          endDate
+        )
+      ).length,
+    [data.assignments, startDate, endDate]
+  );
+
+  const filteredPendingRequests = useMemo(
+    () =>
+      data.requests.filter(
+        (item) =>
+          normalizeStatus(item.status) === "pending" &&
+          inPeriod(
+            item.createdAt || item.requestedAt,
+            startDate,
+            endDate
+          )
+      ).length,
+    [data.requests, startDate, endDate]
+  );
+
   function downloadWorkerReport() {
     if (!selectedWorker) return;
 
-    // Only the selected worker's report is printed.
     const safeName = personName(selectedWorker)
       .replace(/[^a-z0-9]+/gi, "-")
       .replace(/^-|-$/g, "");
 
-    document.title = `Abes-Worker-Report-${safeName}-${startDate || "all-time"}-${endDate || "present"}`;
+    const previousTitle = document.title;
+
+    document.title =
+      `Abes-Worker-Report-${safeName}-${startDate || "all-time"}-${endDate || "present"}`;
+
     window.print();
+
+    // Restore the original title after the browser has opened the print
+    // dialogue. A short timeout is not required for the print operation.
+    window.setTimeout(() => {
+      document.title = previousTitle;
+    }, 1000);
   }
 
   if (authLoading || loading) {
@@ -654,24 +1180,30 @@ export default function AdminReportsPage() {
           <p className="text-sm font-bold tracking-wider text-[#1769E0]">
             MANAGEMENT REPORTS
           </p>
+
           <h1 className="mt-2 text-2xl font-bold text-[#172033] sm:text-3xl">
             Staff & Finance Reports
           </h1>
+
           <p className="mt-2 max-w-2xl text-sm leading-6 text-[#475467]">
-            Review each worker's assignments, requests, expenses, salary
-            payments, outstanding balance, and submitted work.
+            Review staff assignments, money requests, job expenses, salary
+            payments, outstanding balances, and submitted work.
           </p>
         </div>
 
         <div className="flex items-center gap-2 rounded-xl border border-[#DCE5F0] bg-white px-4 py-3 text-sm text-[#172033]">
           <Users size={19} className="text-[#1769E0]" />
-          <span className="font-semibold">{data.workers.length} workers</span>
+          <span className="font-semibold">
+            {data.workers.length} workers
+          </span>
         </div>
       </div>
 
       {error && (
         <div className="rounded-xl border border-red-300 bg-red-50 p-4 text-sm text-red-900">
-          <p className="font-semibold">Some report data could not be loaded.</p>
+          <p className="font-semibold">
+            Some report data could not be loaded.
+          </p>
           <p className="mt-1">{error}</p>
         </div>
       )}
@@ -679,7 +1211,7 @@ export default function AdminReportsPage() {
       {/* FILTERS */}
       <Panel
         title="Report filters"
-        description="Choose a worker and reporting period. Salary balances always show the current outstanding amount."
+        description="Choose a worker and reporting period. Salary balances show the current balance across the full salary history."
       >
         <div className="grid grid-cols-1 gap-4 p-5 sm:grid-cols-2 xl:grid-cols-4">
           <label className="text-sm font-semibold text-[#344054]">
@@ -706,14 +1238,11 @@ export default function AdminReportsPage() {
               className="mt-2 w-full rounded-xl border border-[#B8C7D9] bg-white px-3 py-2.5 text-sm text-[#172033] outline-none focus:border-[#1769E0] focus:ring-2 focus:ring-blue-100"
             >
               <option value="">Choose a worker</option>
-              {data.workers
-                .slice()
-                .sort((a, b) => personName(a).localeCompare(personName(b)))
-                .map((worker) => (
-                  <option key={worker.id} value={worker.id}>
-                    {personName(worker)}
-                  </option>
-                ))}
+              {visibleWorkers.map((worker) => (
+                <option key={worker.id} value={worker.id}>
+                  {personName(worker)}
+                </option>
+              ))}
             </select>
           </label>
 
@@ -742,8 +1271,9 @@ export default function AdminReportsPage() {
 
         <div className="flex flex-wrap items-center justify-between gap-3 border-t border-[#DCE5F0] px-5 py-4">
           <p className="text-xs leading-5 text-[#475467]">
-            Activity tables use the selected date range. Salary obligations
-            use all approved advances and valid salary-linked payments.
+            Activity tables use the selected date range. Salary balances use
+            full-history issued advances, eligible expenses, and valid
+            salary payments.
           </p>
 
           <button
@@ -764,7 +1294,7 @@ export default function AdminReportsPage() {
       {/* ALL WORKERS SUMMARY */}
       <Panel
         title="Worker overview"
-        description="Outstanding salary balances for every worker. Select View report to open an individual report."
+        description="Review each worker's current salary balance, including issued advances and eligible expenses. Select View report for a detailed breakdown."
       >
         <div className="border-b border-[#DCE5F0] p-4">
           <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
@@ -774,24 +1304,18 @@ export default function AdminReportsPage() {
               value={data.workers.length}
               note="Registered worker records"
             />
+
             <StatCard
               icon={BriefcaseBusiness}
               label="Assignments"
-              value={data.assignments.filter((item) =>
-                inPeriod(item.createdAt || item.startDate, startDate, endDate)
-              ).length}
+              value={filteredAssignmentCount}
               note="Assignments in the selected period"
             />
+
             <StatCard
               icon={Clock}
               label="Pending requests"
-              value={
-                data.requests.filter(
-                  (item) =>
-                    item.status === "pending" &&
-                    inPeriod(item.createdAt, startDate, endDate)
-                ).length
-              }
+              value={filteredPendingRequests}
               note="Requests awaiting admin review"
             />
           </div>
@@ -802,7 +1326,8 @@ export default function AdminReportsPage() {
             "Worker",
             "Assignments",
             "Agreed salary",
-            "Approved advances",
+            "Issued advances",
+            "Job expenses deducted",
             "Salary paid",
             "Balance owed",
             "Action",
@@ -822,16 +1347,26 @@ export default function AdminReportsPage() {
                 <p className="font-bold text-[#172033]">
                   {personName(row.worker)}
                 </p>
+
                 <p className="mt-1 text-xs text-[#475467]">
-                  {row.worker.employeeId || row.worker.email || "Staff member"}
+                  {row.worker.employeeId ||
+                    row.worker.email ||
+                    "Staff member"}
                 </p>
               </td>
-              <td className="px-4 py-4 text-[#172033]">
-                {row.assignments}
-              </td>
+
+              <td className="px-4 py-4">{row.assignments}</td>
+
               <td className="px-4 py-4">{moneyCell(row.salary)}</td>
+
               <td className="px-4 py-4">{moneyCell(row.advances)}</td>
+
+              <td className="px-4 py-4">
+                {moneyCell(row.expensesDeducted)}
+              </td>
+
               <td className="px-4 py-4">{moneyCell(row.paid)}</td>
+
               <td className="px-4 py-4 font-bold">
                 <span
                   className={
@@ -845,6 +1380,7 @@ export default function AdminReportsPage() {
                   {currency(row.balance)}
                 </span>
               </td>
+
               <td className="px-4 py-4">
                 <button
                   type="button"
@@ -868,6 +1404,7 @@ export default function AdminReportsPage() {
               <h2 className="text-xl font-bold text-[#172033]">
                 Individual worker report
               </h2>
+
               <p className="mt-1 text-sm text-[#475467]">
                 All sections below belong to {personName(selectedWorker)}.
               </p>
@@ -879,46 +1416,55 @@ export default function AdminReportsPage() {
               className="inline-flex items-center justify-center gap-2 rounded-xl bg-[#1769E0] px-5 py-3 text-sm font-bold text-white shadow-sm hover:bg-[#0F3D70]"
             >
               <Download size={18} />
-              Download this worker's PDF
+              Print / Save as PDF
             </button>
           </div>
 
           <div id="worker-print-report" className="space-y-5">
-            {/* Printable heading */}
+            {/* PRINTABLE HEADING */}
             <div className="worker-print-heading hidden">
               <h1>Abes Power and Construction</h1>
               <h2>Individual Staff & Finance Report</h2>
+
               <p>
                 Worker: <strong>{personName(selectedWorker)}</strong>
               </p>
+
               <p>
                 Employee ID: {selectedWorker.employeeId || "Not recorded"}
               </p>
+
               <p>Email: {selectedWorker.email || "Not recorded"}</p>
               <p>Phone: {selectedWorker.phone || "Not recorded"}</p>
+
               <p>
                 Reporting period: {startDate || "All available dates"} to{" "}
                 {endDate || "Present"}
               </p>
+
               <p>Generated: {new Date().toLocaleString()}</p>
             </div>
 
-            {/* Worker identity */}
+            {/* WORKER IDENTITY */}
             <section className="rounded-2xl border border-[#DCE5F0] bg-white p-5 shadow-sm">
               <div className="flex flex-col justify-between gap-4 sm:flex-row sm:items-center">
                 <div>
                   <p className="text-xs font-bold tracking-wider text-[#1769E0]">
                     STAFF MEMBER
                   </p>
+
                   <h2 className="mt-1 text-2xl font-bold text-[#172033]">
                     {personName(selectedWorker)}
                   </h2>
+
                   <p className="mt-2 text-sm text-[#344054]">
                     Employee ID: {selectedWorker.employeeId || "—"}
                   </p>
+
                   <p className="mt-1 text-sm text-[#344054]">
                     Email: {selectedWorker.email || "—"}
                   </p>
+
                   <p className="mt-1 text-sm text-[#344054]">
                     Phone: {selectedWorker.phone || "—"}
                   </p>
@@ -928,9 +1474,11 @@ export default function AdminReportsPage() {
                   <p className="text-sm font-medium text-[#344054]">
                     Current salary balance
                   </p>
+
                   <p className="mt-2 text-2xl font-bold text-[#172033]">
                     {currency(totals.balance)}
                   </p>
+
                   <p className="mt-1 text-xs text-[#475467]">
                     Across this worker's salary records
                   </p>
@@ -938,68 +1486,83 @@ export default function AdminReportsPage() {
               </div>
             </section>
 
-            {/* Financial and activity summary */}
-            <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-4">
+            {/* FINANCIAL AND ACTIVITY SUMMARY */}
+            <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-3">
               <StatCard
                 icon={Wallet}
                 label="Agreed salaries"
                 value={currency(totals.salaryTotal)}
-                note="Total of current salary records"
+                note="Total agreed salary across all salary records"
               />
+
+              <StatCard
+                icon={Banknote}
+                label="Issued advances"
+                value={currency(totals.advances)}
+                note="Requests confirmed as issued or paid"
+              />
+
               <StatCard
                 icon={Receipt}
-                label="Approved advances"
-                value={currency(totals.advances)}
-                note="Allocated to salary records"
+                label="Job expenses deducted"
+                value={currency(totals.expensesDeducted)}
+                note="Eligible job expenses after duplicate checks"
               />
+
               <StatCard
                 icon={Banknote}
                 label="Salary paid"
                 value={currency(totals.paid)}
-                note="Valid payments linked to salary records"
+                note="Valid salary payments attributed to this worker"
               />
+
               <StatCard
                 icon={Activity}
                 label="Outstanding balance"
                 value={currency(totals.balance)}
-                note="Salary less advances and payments"
+                note="Salary less advances, eligible expenses, and payments"
               />
+
               <StatCard
                 icon={BriefcaseBusiness}
                 label="Assignments"
                 value={totals.assignments}
                 note={`${totals.completed} completed · ${totals.inProgress} in progress`}
               />
+
               <StatCard
                 icon={Clock}
                 label="Pending requests"
                 value={totals.pendingRequests}
-                note="Waiting for admin review"
+                note="Requests waiting for admin review"
               />
+
               <StatCard
                 icon={Camera}
                 label="Work submissions"
                 value={totals.submissions}
                 note={`${totals.pendingSubmissions} awaiting review`}
               />
+
               <StatCard
                 icon={Receipt}
                 label="Recorded expenses"
                 value={currency(totals.expenseTotal)}
-                note="Reported separately from salary deductions"
+                note="Valid expenses recorded in the selected period"
               />
             </div>
 
-            {/* Salary breakdown */}
+            {/* SALARY BREAKDOWN */}
             <Panel
               title="1. Salary and outstanding balance"
-              description="Each salary record is calculated separately to avoid mixing payments or advances between jobs."
+              description="Each salary record is calculated separately. Transactions are attributed to a job where possible to prevent mixing amounts between assignments."
             >
               <ReportTable
                 headers={[
                   "Project / job",
                   "Agreed salary",
-                  "Approved advances",
+                  "Issued advances",
+                  "Job expenses deducted",
                   "Paid",
                   "Balance owed",
                 ]}
@@ -1010,31 +1573,79 @@ export default function AdminReportsPage() {
                     <td className="px-4 py-4 font-semibold text-[#172033]">
                       {salary.project?.name ||
                         salary.project?.service ||
+                        salary.project?.title ||
                         salary.projectId ||
                         salary.assignmentId ||
                         "Unassigned job"}
                     </td>
+
                     <td className="px-4 py-4">
                       {moneyCell(salary.agreedSalary)}
                     </td>
+
                     <td className="px-4 py-4">
                       {moneyCell(salary.advances)}
                     </td>
+
+                    <td className="px-4 py-4">
+                      {moneyCell(salary.expensesDeducted)}
+                    </td>
+
                     <td className="px-4 py-4">
                       {moneyCell(salary.paid)}
                     </td>
+
                     <td className="px-4 py-4 font-bold">
                       {moneyCell(salary.balance)}
                     </td>
                   </tr>
                 ))}
               </ReportTable>
+
+              <div className="border-t border-[#DCE5F0] bg-[#F8FBFF] px-5 py-4">
+                <div className="grid grid-cols-1 gap-3 text-sm sm:grid-cols-2 xl:grid-cols-5">
+                  <div>
+                    <p className="text-[#475467]">Agreed salary</p>
+                    <p className="mt-1 font-bold">
+                      {currency(totals.salaryTotal)}
+                    </p>
+                  </div>
+
+                  <div>
+                    <p className="text-[#475467]">Issued advances</p>
+                    <p className="mt-1 font-bold">
+                      {currency(totals.advances)}
+                    </p>
+                  </div>
+
+                  <div>
+                    <p className="text-[#475467]">Eligible expenses</p>
+                    <p className="mt-1 font-bold">
+                      {currency(totals.expensesDeducted)}
+                    </p>
+                  </div>
+
+                  <div>
+                    <p className="text-[#475467]">Salary paid</p>
+                    <p className="mt-1 font-bold">
+                      {currency(totals.paid)}
+                    </p>
+                  </div>
+
+                  <div>
+                    <p className="text-[#475467]">Current balance</p>
+                    <p className="mt-1 font-bold text-[#1769E0]">
+                      {currency(totals.balance)}
+                    </p>
+                  </div>
+                </div>
+              </div>
             </Panel>
 
-            {/* Requests */}
+            {/* MONEY REQUESTS */}
             <Panel
               title="2. Money requests"
-              description="Requests submitted by this worker during the selected period."
+              description="Approved requests are not automatically treated as issued advances. The report checks disbursement fields before deducting an advance from salary."
             >
               <ReportTable
                 headers={[
@@ -1042,7 +1653,7 @@ export default function AdminReportsPage() {
                   "Request type",
                   "Project",
                   "Amount",
-                  "Status",
+                  "Request / disbursement status",
                   "Reason",
                 ]}
                 emptyMessage="No money requests found for this worker in this period."
@@ -1050,20 +1661,30 @@ export default function AdminReportsPage() {
                 {workerRequests.map((item) => (
                   <tr key={item.id}>
                     <td className="whitespace-nowrap px-4 py-4">
-                      {formatDate(item.createdAt)}
+                      {formatDate(item.createdAt || item.requestedAt)}
                     </td>
+
                     <td className="px-4 py-4">
-                      {statusLabel(item.type)}
+                      {statusLabel(item.type || item.category)}
                     </td>
+
                     <td className="px-4 py-4">
                       {projectMap.get(item.projectId)?.name ||
                         projectMap.get(item.projectId)?.service ||
+                        projectMap.get(item.projectId)?.title ||
                         "—"}
                     </td>
-                    <td className="px-4 py-4">{moneyCell(item.amount)}</td>
+
                     <td className="px-4 py-4">
-                      <StatusBadge value={item.status} />
+                      {moneyCell(
+                        amountOf(item, "amount", "requestedAmount")
+                      )}
                     </td>
+
+                    <td className="px-4 py-4">
+                      <StatusBadge value={requestDisplayStatus(item)} />
+                    </td>
+
                     <td className="max-w-xs px-4 py-4 text-[#344054]">
                       {item.reason || item.description || item.notes || "—"}
                     </td>
@@ -1072,17 +1693,22 @@ export default function AdminReportsPage() {
               </ReportTable>
             </Panel>
 
-            {/* Expenses */}
+            {/* RECORDED EXPENSES */}
             <Panel
               title="3. Recorded expenses"
-              description="Expenses assigned to this worker. These are reported separately because an expense may already be represented by a money request."
+              description="This table shows valid expense records in the selected period. Only expenses attributed to a salary record are deducted from that salary; expenses linked to an already-counted issued advance are excluded from the deduction to avoid double-counting."
             >
               <div className="border-b border-[#DCE5F0] bg-[#F8FBFF] px-4 py-3">
                 <p className="text-sm font-medium text-[#344054]">
-                  Total recorded expenses:{" "}
+                  Recorded expenses in this period:{" "}
                   <strong className="text-[#172033]">
                     {currency(totals.expenseTotal)}
                   </strong>
+                </p>
+
+                <p className="mt-1 text-xs leading-5 text-[#475467]">
+                  Salary-deductible expenses across the full salary history:{" "}
+                  <strong>{currency(totals.expensesDeducted)}</strong>
                 </p>
               </div>
 
@@ -1102,30 +1728,38 @@ export default function AdminReportsPage() {
                     <td className="whitespace-nowrap px-4 py-4">
                       {formatDate(item.createdAt || item.expenseDate)}
                     </td>
+
                     <td className="px-4 py-4">
                       {statusLabel(item.category || item.type)}
                     </td>
+
                     <td className="max-w-xs px-4 py-4 text-[#344054]">
                       {item.description || item.notes || "—"}
                     </td>
+
                     <td className="px-4 py-4">
                       {projectMap.get(item.projectId)?.name ||
                         projectMap.get(item.projectId)?.service ||
+                        projectMap.get(item.projectId)?.title ||
                         "—"}
                     </td>
-                    <td className="px-4 py-4">{moneyCell(item.amount)}</td>
+
                     <td className="px-4 py-4">
-                      <StatusBadge value={item.status} />
+                      {moneyCell(amountOf(item, "amount", "total"))}
+                    </td>
+
+                    <td className="px-4 py-4">
+                      <StatusBadge value={item.status || "recorded"} />
                     </td>
                   </tr>
                 ))}
               </ReportTable>
             </Panel>
 
-            {/* Payments */}
+            {/* SALARY PAYMENT HISTORY */}
             <Panel
               title="4. Salary payment history"
-              description="Payments made to this worker during the selected period. Only payments linked to salary records are included in the salary balance calculation."
+              description="Only valid payments are deducted from the salary balance. Pending or void payment records remain visible here where applicable but are not counted as completed payments."
             >
               <ReportTable
                 headers={[
@@ -1138,35 +1772,77 @@ export default function AdminReportsPage() {
                 ]}
                 emptyMessage="No salary payments found for this worker in this period."
               >
-                {workerPayments.map((item) => (
-                  <tr key={item.id}>
-                    <td className="whitespace-nowrap px-4 py-4">
-                      {formatDate(item.paymentDate || item.createdAt)}
-                    </td>
-                    <td className="px-4 py-4">
-                      {projectMap.get(item.projectId)?.name ||
-                        projectMap.get(item.projectId)?.service ||
-                        workerSalaries.find(
-                          (salary) => salary.id === item.salaryId
-                        )?.project?.name ||
-                        "—"}
-                    </td>
-                    <td className="px-4 py-4">{moneyCell(item.amount)}</td>
-                    <td className="px-4 py-4">
-                      {item.method || item.paymentMethod || "—"}
-                    </td>
-                    <td className="px-4 py-4">
-                      {item.reference || item.receiptNumber || "—"}
-                    </td>
-                    <td className="px-4 py-4">
-                      <StatusBadge value={item.status || "recorded"} />
-                    </td>
-                  </tr>
-                ))}
+                {workerPayments.map((item) => {
+                  const linkedSalary = workerSalaries.find(
+                    (salary) =>
+                      (item.salaryId &&
+                        String(salary.id) === String(item.salaryId)) ||
+                      (item.assignmentId &&
+                        salary.assignmentId &&
+                        String(salary.assignmentId) ===
+                          String(item.assignmentId))
+                  );
+
+                  const paymentProjectId =
+                    item.projectId ||
+                    item.projectID ||
+                    linkedSalary?.projectId;
+
+                  const paymentIsCounted = isPaymentCountable(item);
+
+                  return (
+                    <tr key={item.id}>
+                      <td className="whitespace-nowrap px-4 py-4">
+                        {formatDate(item.paymentDate || item.createdAt)}
+                      </td>
+
+                      <td className="px-4 py-4">
+                        {projectMap.get(paymentProjectId)?.name ||
+                          projectMap.get(paymentProjectId)?.service ||
+                          projectMap.get(paymentProjectId)?.title ||
+                          linkedSalary?.project?.name ||
+                          "—"}
+                      </td>
+
+                      <td className="px-4 py-4">
+                        {moneyCell(
+                          amountOf(
+                            item,
+                            "amount",
+                            "paidAmount",
+                            "paymentAmount"
+                          )
+                        )}
+                      </td>
+
+                      <td className="px-4 py-4">
+                        {item.method || item.paymentMethod || "—"}
+                      </td>
+
+                      <td className="px-4 py-4">
+                        {item.reference || item.receiptNumber || "—"}
+                      </td>
+
+                      <td className="px-4 py-4">
+                        <div className="space-y-1">
+                          <StatusBadge
+                            value={item.status || "recorded"}
+                          />
+
+                          {!paymentIsCounted && (
+                            <p className="text-xs text-[#475467]">
+                              Not deducted from salary
+                            </p>
+                          )}
+                        </div>
+                      </td>
+                    </tr>
+                  );
+                })}
               </ReportTable>
             </Panel>
 
-            {/* Assignments */}
+            {/* ASSIGNMENTS */}
             <Panel
               title="5. Assigned jobs and progress"
               description="Jobs assigned to this worker in the selected reporting period."
@@ -1181,35 +1857,48 @@ export default function AdminReportsPage() {
                 ]}
                 emptyMessage="No assignments found for this worker in this period."
               >
-                {workerAssignments.map((item) => (
-                  <tr key={item.id}>
-                    <td className="px-4 py-4 font-semibold text-[#172033]">
-                      {projectMap.get(item.projectId)?.name ||
-                        projectMap.get(item.projectId)?.service ||
-                        item.projectId ||
-                        "Unknown project"}
-                    </td>
-                    <td className="whitespace-nowrap px-4 py-4">
-                      {formatDate(item.startDate)}
-                    </td>
-                    <td className="whitespace-nowrap px-4 py-4">
-                      {formatDate(item.expectedCompletion)}
-                    </td>
-                    <td className="px-4 py-4">
-                      <StatusBadge value={item.status} />
-                    </td>
-                    <td className="px-4 py-4 text-[#344054]">
-                      {item.notes || item.description || "—"}
-                    </td>
-                  </tr>
-                ))}
+                {workerAssignments.map((item) => {
+                  const projectId =
+                    item.projectId || item.projectID || item.jobId;
+                  const project = projectMap.get(projectId);
+
+                  return (
+                    <tr key={item.id}>
+                      <td className="px-4 py-4 font-semibold text-[#172033]">
+                        {project?.name ||
+                          project?.service ||
+                          project?.title ||
+                          projectId ||
+                          "Unknown project"}
+                      </td>
+
+                      <td className="whitespace-nowrap px-4 py-4">
+                        {formatDate(item.startDate)}
+                      </td>
+
+                      <td className="whitespace-nowrap px-4 py-4">
+                        {formatDate(
+                          item.expectedCompletion || item.deadline
+                        )}
+                      </td>
+
+                      <td className="px-4 py-4">
+                        <StatusBadge value={item.status} />
+                      </td>
+
+                      <td className="px-4 py-4 text-[#344054]">
+                        {item.notes || item.description || "—"}
+                      </td>
+                    </tr>
+                  );
+                })}
               </ReportTable>
             </Panel>
 
-            {/* Work submissions */}
+            {/* WORK SUBMISSIONS */}
             <Panel
               title="6. Work submissions and reviews"
-              description="Work evidence and review statuses submitted by this worker."
+              description="Submission review status takes priority over the general submission status when it is available."
             >
               <ReportTable
                 headers={[
@@ -1220,28 +1909,42 @@ export default function AdminReportsPage() {
                 ]}
                 emptyMessage="No work submissions found for this worker in this period."
               >
-                {workerSubmissions.map((item) => (
-                  <tr key={item.id}>
-                    <td className="whitespace-nowrap px-4 py-4">
-                      {formatDate(item.createdAt || item.submittedAt)}
-                    </td>
-                    <td className="px-4 py-4">
-                      {projectMap.get(item.projectId)?.name ||
-                        projectMap.get(item.projectId)?.service ||
-                        "—"}
-                    </td>
-                    <td className="max-w-sm px-4 py-4 text-[#344054]">
-                      {item.comment || item.description || "No comment"}
-                    </td>
-                    <td className="px-4 py-4">
-                      <StatusBadge value={item.status} />
-                    </td>
-                  </tr>
-                ))}
+                {workerSubmissions.map((item) => {
+                  const submissionProjectId =
+                    item.projectId || item.projectID || item.jobId;
+
+                  return (
+                    <tr key={item.id}>
+                      <td className="whitespace-nowrap px-4 py-4">
+                        {formatDate(item.createdAt || item.submittedAt)}
+                      </td>
+
+                      <td className="px-4 py-4">
+                        {projectMap.get(submissionProjectId)?.name ||
+                          projectMap.get(submissionProjectId)?.service ||
+                          projectMap.get(submissionProjectId)?.title ||
+                          "—"}
+                      </td>
+
+                      <td className="max-w-sm px-4 py-4 text-[#344054]">
+                        {item.comment ||
+                          item.description ||
+                          item.notes ||
+                          "No comment"}
+                      </td>
+
+                      <td className="px-4 py-4">
+                        <StatusBadge
+                          value={item.reviewStatus || item.status}
+                        />
+                      </td>
+                    </tr>
+                  );
+                })}
               </ReportTable>
             </Panel>
 
-            {/* Financial notes */}
+            {/* FINANCIAL NOTES */}
             <section className="rounded-2xl border border-[#DCE5F0] bg-white p-5">
               <h2 className="font-bold text-[#172033]">
                 Important financial notes
@@ -1249,26 +1952,54 @@ export default function AdminReportsPage() {
 
               <ul className="mt-3 list-disc space-y-2 pl-5 text-sm leading-6 text-[#344054]">
                 <li>
-                  Salary balance = agreed salary − approved advances − valid
-                  payments linked to that salary.
+                  Salary balance = agreed salary − issued advances −
+                  salary-deductible expenses − valid salary payments.
                 </li>
+
                 <li>
-                  Expenses are shown separately and are not automatically
-                  deducted from salary.
+                  A request with status "approved" is not counted as an
+                  advance unless the record also confirms that the money was
+                  issued or paid.
                 </li>
+
                 <li>
-                  Approved requests may not have been paid out yet. Approval
-                  alone does not prove disbursement.
+                  When money is issued, update the money request with a
+                  disbursement status such as "disbursed", or set a field such
+                  as "disbursedAt". The report recognizes common disbursement
+                  fields, including "issuedAt" and "paidAt".
                 </li>
+
                 <li>
-                  The date range filters activity records, but the salary
-                  balance shows the current balance across the full history.
+                  For reliable matching, record the relevant worker,
+                  assignment, and project IDs on expenses and payments. If a
+                  record has only a project ID, it is attributed only when
+                  there is one matching assignment and one matching salary
+                  record for that worker and project.
                 </li>
+
                 <li>
-                  An advance without an assignment ID is allocated only when
-                  there is exactly one matching assignment for that worker and
-                  project. Unmatched legacy requests may not appear in the
-                  salary deduction total.
+                  To prevent double deductions, link an expense created from
+                  an issued money request using a field such as
+                  "moneyRequestId", "requestId", or "sourceRequestId".
+                </li>
+
+                <li>
+                  Set "salaryDeductible" or "deductFromSalary" to false on an
+                  expense that should be reported but must not reduce the
+                  worker's salary. If neither flag is set, an ordinary
+                  job-linked expense is treated as deductible.
+                </li>
+
+                <li>
+                  Date filters affect activity tables. The salary balance
+                  always uses the full available salary history.
+                </li>
+
+                <li>
+                  A negative balance means the deductions and payments
+                  recorded against the salary are greater than the agreed
+                  salary. Check the underlying records before making further
+                  payments.
                 </li>
               </ul>
             </section>
@@ -1284,19 +2015,20 @@ export default function AdminReportsPage() {
           <span className="mx-auto flex h-14 w-14 items-center justify-center rounded-2xl bg-[#EAF4FF] text-[#1769E0]">
             <FileText size={27} />
           </span>
+
           <h2 className="mt-4 text-lg font-bold text-[#172033]">
             Select a worker to view their report
           </h2>
+
           <p className="mx-auto mt-2 max-w-md text-sm leading-6 text-[#475467]">
-            Choose a worker from the selector above or click View report in the
-            worker overview. The individual report will show only that worker's
-            records and can be printed or saved as a PDF.
+            Choose a worker from the selector above or click View report in
+            the worker overview. The individual report will show that
+            worker's records and can be printed or saved as a PDF.
           </p>
         </div>
       )}
 
       <style jsx global>{`
-        /* Improve readable text colors on the regular screen. */
         #worker-print-report {
           color: #172033;
         }
@@ -1308,7 +2040,6 @@ export default function AdminReportsPage() {
           -webkit-text-fill-color: currentColor;
         }
 
-        /* Do not let global dashboard print styles affect this report. */
         @media print {
           @page {
             size: A4 landscape;
@@ -1390,7 +2121,7 @@ export default function AdminReportsPage() {
           }
 
           #worker-print-report .grid {
-            grid-template-columns: repeat(4, minmax(0, 1fr)) !important;
+            grid-template-columns: repeat(3, minmax(0, 1fr)) !important;
             gap: 8px !important;
           }
 
@@ -1454,11 +2185,6 @@ export default function AdminReportsPage() {
           #worker-print-report .text-[#9F1239] {
             color: #172033 !important;
             -webkit-text-fill-color: #172033 !important;
-          }
-
-          /* Hide all dashboard controls and the all-workers overview. */
-          body > * {
-            visibility: hidden !important;
           }
 
           nav,

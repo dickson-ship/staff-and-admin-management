@@ -1,4 +1,3 @@
-
 "use client";
 
 import { useEffect, useMemo, useState } from "react";
@@ -15,17 +14,15 @@ import {
   Users,
   Wallet,
   WalletCards,
+  Receipt,
 } from "lucide-react";
 
-import {
-  collection,
-  onSnapshot,
-} from "firebase/firestore";
+import { collection, onSnapshot } from "firebase/firestore";
 
 import { db } from "@/config/Firebase";
 import { useAuth } from "@/providers/AuthProvider";
 
-// Firestore collections.
+// Firestore collections used by the dashboard.
 const REPORT_COLLECTIONS = {
   workers: "workers",
   projects: "projects",
@@ -33,6 +30,7 @@ const REPORT_COLLECTIONS = {
   expenses: "expenses",
   workerPayments: "workerPayments",
   moneyRequests: "moneyRequests",
+  resources: "resourceInventory",
 };
 
 const moneyFormatter = new Intl.NumberFormat("en-GH", {
@@ -47,31 +45,81 @@ function money(value) {
 }
 
 function amountOf(record) {
-  return Number(record.amount ?? record.total ?? 0) || 0;
+  return Number(record?.amount ?? record?.total ?? 0) || 0;
 }
 
 function normalizedStatus(status) {
   return String(status || "").trim().toLowerCase();
 }
 
-function isCompletedPayment(record) {
-  const status = normalizedStatus(record.status);
+function getTimestamp(value) {
+  if (!value) return 0;
 
-  // A payment should count as money received or paid only when confirmed.
+  if (typeof value?.toMillis === "function") {
+    return value.toMillis();
+  }
+
+  if (typeof value?.toDate === "function") {
+    return value.toDate().getTime();
+  }
+
+  const date = value instanceof Date ? value : new Date(value);
+
+  return Number.isNaN(date.getTime()) ? 0 : date.getTime();
+}
+
+function formatDate(value) {
+  const timestamp = getTimestamp(value);
+
+  if (!timestamp) return "Date unavailable";
+
+  return new Date(timestamp).toLocaleDateString("en-GB", {
+    day: "2-digit",
+    month: "short",
+    year: "numeric",
+  });
+}
+
+/*
+ * Client payments count as money received only when their status
+ * confirms that the payment has been completed.
+ */
+function isCompletedPayment(record) {
   return [
     "paid",
     "completed",
     "successful",
     "received",
     "approved",
+  ].includes(normalizedStatus(record?.status));
+}
+
+/*
+ * Worker payment records are created by the finance page with
+ * status "recorded". They should therefore count as money spent.
+ */
+function isRecordedWorkerPayment(record) {
+  const status = normalizedStatus(record?.status);
+
+  if (!status) return true;
+
+  return [
+    "recorded",
+    "paid",
+    "completed",
+    "successful",
+    "approved",
+    "confirmed",
   ].includes(status);
 }
 
+/*
+ * Include manual and historical expense records but exclude
+ * pending, rejected, cancelled, and void transactions.
+ */
 function isRecordedExpense(record) {
-  const status = normalizedStatus(record.status);
+  const status = normalizedStatus(record?.status);
 
-  // Include recorded expenses without a status for older records.
-  // Exclude pending requests and rejected/cancelled records.
   if (!status) return true;
 
   return [
@@ -80,6 +128,26 @@ function isRecordedExpense(record) {
     "approved",
     "recorded",
   ].includes(status);
+}
+
+/*
+ * Approved money requests are the authoritative advance records.
+ * If another expense document represents the same advance, exclude
+ * it from ordinary expenses to avoid counting the advance twice.
+ */
+function isAdvanceLinkedExpense(record) {
+  const source = normalizedStatus(record?.source || record?.type);
+  const category = normalizedStatus(record?.category);
+
+  return Boolean(
+    record?.moneyRequestId ||
+      record?.advanceId ||
+      record?.requestId ||
+      source.includes("money_request") ||
+      source.includes("money request") ||
+      source.includes("advance") ||
+      category === "advance"
+  );
 }
 
 function getPersonName(person) {
@@ -151,9 +219,7 @@ function SectionHeading({ title, description, icon: Icon }) {
       </div>
 
       <div>
-        <h2 className="font-semibold text-[#172033]">
-          {title}
-        </h2>
+        <h2 className="font-semibold text-[#172033]">{title}</h2>
 
         <p className="mt-1 text-sm text-[#667085]">
           {description}
@@ -188,10 +254,15 @@ export default function AdminDashboardPage() {
     expenses: [],
     workerPayments: [],
     moneyRequests: [],
+    resources: [],
   });
 
   const [dataLoading, setDataLoading] = useState(true);
   const [dataError, setDataError] = useState("");
+
+  // --------------------------------------------------
+  // AUTHENTICATION
+  // --------------------------------------------------
 
   useEffect(() => {
     if (authLoading) return;
@@ -201,30 +272,35 @@ export default function AdminDashboardPage() {
       return;
     }
 
-    if (profile?.role !== "admin") {
+    if (profile?.role && profile.role !== "admin") {
       router.replace("/staff");
     }
-  }, [user, profile, authLoading, router]);
+  }, [user, profile?.role, authLoading, router]);
+
+  // --------------------------------------------------
+  // FIRESTORE LISTENERS
+  // --------------------------------------------------
 
   useEffect(() => {
     if (authLoading || !user || profile?.role !== "admin") {
       return;
     }
 
-    let initialSnapshots = new Set();
-    let hasError = false;
+    const initiallyLoaded = new Set();
 
     setDataLoading(true);
     setDataError("");
 
-    const unsubscribers = Object.entries(REPORT_COLLECTIONS).map(
-      ([key, collectionName]) => {
-        return onSnapshot(
+    const collectionEntries = Object.entries(REPORT_COLLECTIONS);
+
+    const unsubscribers = collectionEntries.map(
+      ([key, collectionName]) =>
+        onSnapshot(
           collection(db, collectionName),
           (snapshot) => {
-            const items = snapshot.docs.map((doc) => ({
-              id: doc.id,
-              ...doc.data(),
+            const items = snapshot.docs.map((document) => ({
+              id: document.id,
+              ...document.data(),
             }));
 
             setRecords((previous) => ({
@@ -232,12 +308,9 @@ export default function AdminDashboardPage() {
               [key]: items,
             }));
 
-            // Wait for the first result from every collection.
-            initialSnapshots.add(key);
+            initiallyLoaded.add(key);
 
-            if (initialSnapshots.size === Object.keys(
-              REPORT_COLLECTIONS
-            ).length) {
+            if (initiallyLoaded.size === collectionEntries.length) {
               setDataLoading(false);
             }
           },
@@ -247,20 +320,23 @@ export default function AdminDashboardPage() {
               error
             );
 
-            hasError = true;
             setDataError(
               "Some dashboard information could not be loaded. Check your Firestore collection names and security rules."
             );
+
             setDataLoading(false);
           }
-        );
-      }
+        )
     );
 
     return () => {
       unsubscribers.forEach((unsubscribe) => unsubscribe());
     };
-  }, [authLoading, user, profile]);
+  }, [authLoading, user, profile?.role]);
+
+  // --------------------------------------------------
+  // CALCULATE FINANCIAL AND OPERATIONAL TOTALS
+  // --------------------------------------------------
 
   const totals = useMemo(() => {
     const {
@@ -270,33 +346,61 @@ export default function AdminDashboardPage() {
       expenses,
       workerPayments,
       moneyRequests,
+      resources,
     } = records;
 
+    // Money coming into the company.
     const moneyIn = clientPayments
       .filter(isCompletedPayment)
       .reduce((sum, record) => sum + amountOf(record), 0);
 
-    const recordedExpenses = expenses.filter(isRecordedExpense);
+    // Confirmed advances.
+    const approvedAdvances = moneyRequests.filter(
+      (request) =>
+        normalizedStatus(request.status) === "approved"
+    );
+
+    const advancesTotal = approvedAdvances.reduce(
+      (sum, request) => sum + amountOf(request),
+      0
+    );
+
+    // Ordinary expenses do not include documents that duplicate advances.
+    const recordedExpenses = expenses.filter(
+      (record) =>
+        isRecordedExpense(record) &&
+        !isAdvanceLinkedExpense(record)
+    );
 
     const expensesTotal = recordedExpenses.reduce(
       (sum, record) => sum + amountOf(record),
       0
     );
 
-    const staffPaymentsTotal = workerPayments
-      .filter(isCompletedPayment)
-      .reduce((sum, record) => sum + amountOf(record), 0);
+    // Salary payments saved by the finance page use status "recorded".
+    const validWorkerPayments = workerPayments.filter(
+      isRecordedWorkerPayment
+    );
 
-    // Money out = recorded expenses + confirmed staff salary payments.
-    const moneyOut = expensesTotal + staffPaymentsTotal;
+    const staffPaymentsTotal = validWorkerPayments.reduce(
+      (sum, record) => sum + amountOf(record),
+      0
+    );
 
-    const pendingRequests = moneyRequests.filter((request) => {
-      return [
+    /*
+     * Total money out:
+     * approved advances + separate expenses + salary payments.
+     */
+    const moneyOut =
+      advancesTotal + expensesTotal + staffPaymentsTotal;
+
+    const pendingRequests = moneyRequests.filter((request) =>
+      [
         "pending",
         "submitted",
         "under_review",
-      ].includes(normalizedStatus(request.status));
-    });
+      ].includes(normalizedStatus(request.status))
+    );
 
     const pendingAmount = pendingRequests.reduce(
       (sum, request) => sum + amountOf(request),
@@ -325,6 +429,10 @@ export default function AdminDashboardPage() {
       ].includes(status);
     });
 
+    // ----------------------------------------------
+    // RECENT FINANCIAL ACTIVITY
+    // ----------------------------------------------
+
     const activity = [
       ...clientPayments
         .filter(isCompletedPayment)
@@ -339,59 +447,65 @@ export default function AdminDashboardPage() {
             record.updatedAt,
         })),
 
+      ...approvedAdvances.map((record) => ({
+        ...record,
+        activityType: "Worker advance",
+        direction: "out",
+        amount: amountOf(record),
+        date:
+          record.approvedAt ||
+          record.updatedAt ||
+          record.createdAt,
+      })),
+
       ...recordedExpenses.map((record) => ({
         ...record,
         activityType: "Expense recorded",
         direction: "out",
         amount: amountOf(record),
-        date: record.createdAt || record.date,
+        date:
+          record.expenseDate ||
+          record.date ||
+          record.createdAt,
       })),
 
-      ...workerPayments
-        .filter(isCompletedPayment)
-        .map((record) => ({
-          ...record,
-          activityType: "Staff payment",
-          direction: "out",
-          amount: amountOf(record),
-          date:
-            record.paymentDate ||
-            record.createdAt ||
-            record.updatedAt,
-        })),
+      ...validWorkerPayments.map((record) => ({
+        ...record,
+        activityType: "Salary payment",
+        direction: "out",
+        amount: amountOf(record),
+        date:
+          record.paymentDate ||
+          record.createdAt ||
+          record.updatedAt,
+      })),
     ]
-      .sort((a, b) => {
-        const getTime = (value) => {
-          if (!value) return 0;
-
-          if (typeof value?.toDate === "function") {
-            return value.toDate().getTime();
-          }
-
-          const date = new Date(value);
-          return Number.isNaN(date.getTime())
-            ? 0
-            : date.getTime();
-        };
-
-        return getTime(b.date) - getTime(a.date);
-      })
+      .sort((a, b) => getTimestamp(b.date) - getTimestamp(a.date))
       .slice(0, 6);
 
     return {
       moneyIn,
       moneyOut,
       balance: moneyIn - moneyOut,
+
+      advancesTotal,
       expensesTotal,
       staffPaymentsTotal,
+
       pendingRequests: pendingRequests.length,
       pendingAmount,
+
       activeWorkers: activeWorkers.length,
       activeProjects: activeProjects.length,
-      resourcesCount: records.resources?.length || 0,
+      resourcesCount: resources.length,
+
       activity,
     };
   }, [records]);
+
+  // --------------------------------------------------
+  // RENDER
+  // --------------------------------------------------
 
   if (authLoading || !user || profile?.role !== "admin") {
     return <LoadingDashboard />;
@@ -401,28 +515,6 @@ export default function AdminDashboardPage() {
     profile?.firstName ||
     user?.displayName?.split(" ")[0] ||
     "Admin";
-
-  const formatDate = (value) => {
-    if (!value) return "Date unavailable";
-
-    let date;
-
-    if (typeof value?.toDate === "function") {
-      date = value.toDate();
-    } else {
-      date = new Date(value);
-    }
-
-    if (Number.isNaN(date.getTime())) {
-      return "Date unavailable";
-    }
-
-    return date.toLocaleDateString("en-GB", {
-      day: "2-digit",
-      month: "short",
-      year: "numeric",
-    });
-  };
 
   return (
     <main className="space-y-7 bg-[#F8FBFF] text-[#172033]">
@@ -438,7 +530,7 @@ export default function AdminDashboardPage() {
           </h1>
 
           <p className="mt-2 text-sm text-[#667085]">
-            Here's your company's financial and operational summary.
+            Here is your company&apos;s financial and operational summary.
           </p>
         </div>
 
@@ -465,7 +557,7 @@ export default function AdminDashboardPage() {
         <LoadingDashboard />
       ) : (
         <>
-          {/* MAIN FINANCIAL SUMMARY */}
+          {/* FINANCIAL SUMMARY */}
           <section>
             <div className="mb-4">
               <h2 className="text-lg font-semibold text-[#172033]">
@@ -473,13 +565,13 @@ export default function AdminDashboardPage() {
               </h2>
 
               <p className="mt-1 text-sm text-[#667085]">
-                Confirmed transactions recorded in your system.
+                Confirmed payments, advances, and expenses recorded in your system.
               </p>
             </div>
 
             <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-3">
               <StatCard
-                title="Total Money In"
+                title="Money In"
                 value={money(totals.moneyIn)}
                 description="Confirmed client payments"
                 icon={ArrowDownLeft}
@@ -487,28 +579,28 @@ export default function AdminDashboardPage() {
               />
 
               <StatCard
-                title="Total Money Out"
+                title="Money Out"
                 value={money(totals.moneyOut)}
-                description="Expenses and confirmed staff payments"
+                description="Advances, expenses, and salary payments"
                 icon={ArrowUpRight}
                 iconStyle="red"
               />
 
               <StatCard
-                title="Available Balance"
+                title="Net Cash Movement"
                 value={money(totals.balance)}
                 description="Money in minus money out"
                 icon={Wallet}
-                iconStyle="blue"
+                iconStyle={totals.balance < 0 ? "red" : "blue"}
               />
             </div>
           </section>
 
-          {/* SIMPLE INCOME / EXPENSE BREAKDOWN */}
+          {/* EXPENSE BREAKDOWN */}
           <section className="rounded-2xl border border-[#E5EDF5] bg-white p-5 shadow-sm sm:p-6">
             <SectionHeading
               title="Where the money goes"
-              description="A quick breakdown of recorded cash movement"
+              description="Breakdown of recorded company cash movement"
               icon={CircleDollarSign}
             />
 
@@ -570,11 +662,23 @@ export default function AdminDashboardPage() {
               </div>
             </div>
 
-            <div className="mt-6 grid gap-3 border-t border-[#E5EDF5] pt-5 sm:grid-cols-2">
+            {/* Individual spending categories */}
+            <div className="mt-6 grid gap-3 border-t border-[#E5EDF5] pt-5 sm:grid-cols-3">
               <div className="rounded-xl bg-[#F8FBFF] p-4">
                 <p className="text-sm text-[#667085]">
-                  Expenses recorded
+                  Approved advances
                 </p>
+
+                <p className="mt-2 text-lg font-bold text-[#172033]">
+                  {money(totals.advancesTotal)}
+                </p>
+              </div>
+
+              <div className="rounded-xl bg-[#F8FBFF] p-4">
+                <p className="text-sm text-[#667085]">
+                  Other expenses
+                </p>
+
                 <p className="mt-2 text-lg font-bold text-[#172033]">
                   {money(totals.expensesTotal)}
                 </p>
@@ -582,17 +686,30 @@ export default function AdminDashboardPage() {
 
               <div className="rounded-xl bg-[#F8FBFF] p-4">
                 <p className="text-sm text-[#667085]">
-                  Staff payments completed
+                  Salary payments
                 </p>
+
                 <p className="mt-2 text-lg font-bold text-[#172033]">
                   {money(totals.staffPaymentsTotal)}
                 </p>
               </div>
             </div>
 
+            <div className="mt-4 flex items-center justify-between gap-3 rounded-xl border border-[#DCEAF8] bg-[#F5FAFF] p-4">
+              <span className="text-sm font-semibold text-[#172033]">
+                Total money out
+              </span>
+
+              <span className="text-lg font-bold text-[#1769E0]">
+                {money(totals.moneyOut)}
+              </span>
+            </div>
+
             <p className="mt-4 text-xs leading-5 text-[#667085]">
-              Pending requests are not counted as money spent. This is a
-              summary of recorded transactions, not a bank balance.
+              Pending money requests are not included in money spent. Advances
+              are counted from approved requests, ordinary expenses exclude
+              linked advance records to prevent double counting, and recorded
+              salary payments are included.
             </p>
           </section>
 
@@ -612,9 +729,7 @@ export default function AdminDashboardPage() {
               <StatCard
                 title="Active Workers"
                 value={totals.activeWorkers}
-                description={`${
-                  records.workers.length
-                } workers in total`}
+                description={`${records.workers.length} workers in total`}
                 icon={Users}
               />
 
@@ -628,9 +743,7 @@ export default function AdminDashboardPage() {
               <StatCard
                 title="Pending Requests"
                 value={totals.pendingRequests}
-                description={`${money(
-                  totals.pendingAmount
-                )} requested`}
+                description={`${money(totals.pendingAmount)} requested`}
                 icon={Clock3}
                 iconStyle="amber"
               />
@@ -638,7 +751,7 @@ export default function AdminDashboardPage() {
               <StatCard
                 title="Resources Tracked"
                 value={totals.resourcesCount}
-                description="Items in the resources collection"
+                description="Items in inventory"
                 icon={WalletCards}
               />
             </div>
@@ -649,7 +762,7 @@ export default function AdminDashboardPage() {
             <div className="flex items-center justify-between gap-4 border-b border-[#E5EDF5] p-5 sm:p-6">
               <SectionHeading
                 title="Recent financial activity"
-                description="Latest recorded payments and expenses"
+                description="Latest recorded payments, advances, and expenses"
                 icon={Activity}
               />
 
@@ -667,8 +780,8 @@ export default function AdminDashboardPage() {
                 </h3>
 
                 <p className="mt-1 max-w-sm text-sm text-[#667085]">
-                  Confirmed client payments, recorded expenses, and staff
-                  payments will appear here.
+                  Confirmed client payments, approved advances, recorded expenses,
+                  and salary payments will appear here.
                 </p>
               </div>
             ) : (
@@ -716,6 +829,7 @@ export default function AdminDashboardPage() {
                                 {item.description ||
                                   item.category ||
                                   item.projectName ||
+                                  item.notes ||
                                   "Recorded transaction"}
                               </p>
                             </div>
@@ -759,8 +873,8 @@ export default function AdminDashboardPage() {
                 </h2>
 
                 <p className="mt-2 max-w-xl text-sm leading-6 text-blue-100">
-                  Review workers, projects, staff requests, and financial
-                  records from your admin workspace.
+                  Review workers, projects, staff requests, and financial records
+                  from your admin workspace.
                 </p>
               </div>
 

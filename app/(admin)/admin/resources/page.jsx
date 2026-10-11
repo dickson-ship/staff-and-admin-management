@@ -2,382 +2,1164 @@
 
 import { useEffect, useMemo, useState } from "react";
 import {
-  addDoc,
-  collection,
-  deleteDoc,
-  doc,
-  onSnapshot,
-  serverTimestamp,
-  updateDoc,
-} from "firebase/firestore";
-import {
   AlertTriangle,
+  ArrowDownCircle,
+  ArrowUpCircle,
   Boxes,
+  Check,
   CheckCircle2,
-  CircleDollarSign,
-  Edit,
-  Loader2,
+  Clock3,
+  History,
   Package,
+  Pencil,
   Plus,
   Search,
-  Trash2,
+  ShieldCheck,
+  UserRound,
+  Warehouse,
   X,
+  XCircle,
+  RefreshCw,
 } from "lucide-react";
 
-import { db } from "@/config/Firebase";
+import {
+  collection,
+  doc,
+  onSnapshot,
+  runTransaction,
+  serverTimestamp,
+} from "firebase/firestore";
 
-const CATEGORIES = [
-  "Electrical Materials",
-  "Electronics",
-  "Security Equipment",
-  "Tools and Equipment",
-  "Construction Materials",
-  "Safety Equipment",
-  "Networking Materials",
-  "Other",
+import { db } from "@/config/Firebase";
+import { useAuth } from "@/providers/AuthProvider";
+
+const tabs = [
+  { id: "requests", label: "Requests", icon: Clock3 },
+  { id: "inventory", label: "Inventory", icon: Warehouse },
+  { id: "history", label: "History", icon: History },
 ];
 
-const EMPTY_FORM = {
+const emptyResourceForm = {
   name: "",
-  category: "Electrical Materials",
-  quantity: "",
+  category: "Tools",
   unit: "pieces",
-  unitCost: "",
-  minStock: "",
-  location: "",
+  quantity: "0",
+  minimumStock: "0",
+  unitCost: "0",
+  description: "",
+};
+
+const emptyIssueForm = {
+  resourceId: "",
+  quantity: "1",
+  recipientType: "worker",
+  workerId: "",
+  recipientName: "",
+  purpose: "",
   notes: "",
 };
 
-const formatMoney = (amount) =>
-  new Intl.NumberFormat("en-GH", {
+function getDateValue(value) {
+  if (!value) return 0;
+
+  if (typeof value.toMillis === "function") {
+    return value.toMillis();
+  }
+
+  if (value instanceof Date) {
+    return value.getTime();
+  }
+
+  const parsed = new Date(value).getTime();
+
+  return Number.isNaN(parsed) ? 0 : parsed;
+}
+
+function formatDate(value) {
+  if (!value) return "—";
+
+  const timestamp = getDateValue(value);
+
+  if (!timestamp) return "—";
+
+  return new Date(timestamp).toLocaleDateString("en-GH", {
+    day: "numeric",
+    month: "short",
+    year: "numeric",
+  });
+}
+
+function formatMoney(value) {
+  return new Intl.NumberFormat("en-GH", {
     style: "currency",
     currency: "GHS",
     maximumFractionDigits: 2,
-  }).format(Number(amount) || 0);
+  }).format(Number(value) || 0);
+}
 
-const getStockStatus = (resource) => {
-  const quantity = Number(resource.quantity) || 0;
-  const minimum = Number(resource.minStock) || 0;
+function getStatus(request) {
+  return String(request.status || request.requestStatus || "pending")
+    .trim()
+    .toLowerCase();
+}
 
-  if (quantity <= 0) {
-    return {
-      label: "Out of stock",
-      className: "bg-red-50 text-red-700",
-    };
+function getResourceName(request) {
+  return (
+    request.resourceName ||
+    request.itemName ||
+    request.inventoryName ||
+    request.resource ||
+    request.item ||
+    "Unnamed resource"
+  );
+}
+
+function getQuantity(request) {
+  return Number(
+    request.requestedQuantity ??
+      request.quantityRequested ??
+      request.quantity ??
+      0
+  );
+}
+
+function getWorkerName(request, workers) {
+  const savedName =
+    request.workerName ||
+    request.requesterName ||
+    request.staffName ||
+    request.fullName;
+
+  if (savedName) return savedName;
+
+  const workerId =
+    request.workerId || request.requesterId || request.userId || "";
+
+  const worker = workers.find((item) => item.id === workerId);
+
+  if (!worker) return "Unknown requester";
+
+  return (
+    worker.name ||
+    worker.fullName ||
+    [worker.firstName, worker.lastName].filter(Boolean).join(" ") ||
+    worker.email ||
+    "Worker"
+  );
+}
+
+function findInventoryItem(request, inventory) {
+  const resourceId =
+    request.resourceId ||
+    request.inventoryId ||
+    request.resourceDocId ||
+    request.itemId ||
+    "";
+
+  if (resourceId) {
+    const matchedItem = inventory.find(
+      (resource) => resource.id === resourceId
+    );
+
+    if (matchedItem) return matchedItem;
   }
 
-  if (quantity <= minimum) {
-    return {
-      label: "Low stock",
-      className: "bg-amber-50 text-amber-700",
-    };
-  }
+  const requestedName = getResourceName(request).trim().toLowerCase();
 
-  return {
-    label: "In stock",
-    className: "bg-green-50 text-green-700",
+  return (
+    inventory.find(
+      (item) => (item.name || "").trim().toLowerCase() === requestedName
+    ) || null
+  );
+}
+
+function StatusBadge({ status }) {
+  const normalized = String(status || "pending").toLowerCase();
+
+  const styles = {
+    pending: "bg-amber-50 text-amber-700",
+    requested: "bg-amber-50 text-amber-700",
+    approved: "bg-blue-50 text-blue-700",
+    fulfilled: "bg-emerald-50 text-emerald-700",
+    completed: "bg-emerald-50 text-emerald-700",
+    issued: "bg-emerald-50 text-emerald-700",
+    rejected: "bg-red-50 text-red-700",
+    declined: "bg-red-50 text-red-700",
+    cancelled: "bg-slate-100 text-slate-600",
   };
-};
 
-export default function ResourcesPage() {
-  const [resources, setResources] = useState([]);
+  const label = normalized.replaceAll("_", " ");
+
+  return (
+    <span
+      className={`inline-flex rounded-full px-2.5 py-1 text-xs font-medium capitalize ${
+        styles[normalized] || "bg-slate-100 text-slate-600"
+      }`}
+    >
+      {label}
+    </span>
+  );
+}
+
+function SummaryCard({ icon: Icon, label, value, note }) {
+  return (
+    <div className="rounded-xl border border-slate-200 bg-white p-4">
+      <div className="flex items-center justify-between gap-3">
+        <div className="min-w-0">
+          <p className="text-sm text-slate-500">{label}</p>
+
+          <p className="mt-1 text-2xl font-semibold tracking-tight text-slate-900">
+            {value}
+          </p>
+
+          {note && (
+            <p className="mt-1 text-xs text-slate-500">{note}</p>
+          )}
+        </div>
+
+        <div className="rounded-lg bg-blue-50 p-2.5 text-blue-700">
+          <Icon size={20} />
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function EmptyState({
+  icon: Icon = Package,
+  title,
+  description,
+}) {
+  return (
+    <div className="px-5 py-12 text-center">
+      <div className="mx-auto flex h-12 w-12 items-center justify-center rounded-xl bg-slate-100 text-slate-500">
+        <Icon size={23} />
+      </div>
+
+      <h3 className="mt-3 text-sm font-semibold text-slate-900">
+        {title}
+      </h3>
+
+      <p className="mx-auto mt-1 max-w-sm text-sm text-slate-500">
+        {description}
+      </p>
+    </div>
+  );
+}
+
+function FormField({ label, children }) {
+  return (
+    <div>
+      <label className="mb-1.5 block text-sm font-medium text-slate-700">
+        {label}
+      </label>
+
+      {children}
+    </div>
+  );
+}
+
+const inputClass =
+  "w-full rounded-lg border border-slate-200 bg-white px-3 py-2.5 text-sm text-slate-800 outline-none transition placeholder:text-slate-400 focus:border-blue-500 focus:ring-2 focus:ring-blue-100";
+
+export default function AdminResourcesPage() {
+  const { user, profile, authLoading, isAdmin } = useAuth();
+
+  const adminAllowed = Boolean(isAdmin || profile?.role === "admin");
+
+  const [activeTab, setActiveTab] = useState("requests");
+
+  const [inventory, setInventory] = useState([]);
+  const [workers, setWorkers] = useState([]);
+  const [requests, setRequests] = useState([]);
+  const [transactions, setTransactions] = useState([]);
+
   const [loading, setLoading] = useState(true);
-  const [saving, setSaving] = useState(false);
+  const [requestsLoaded, setRequestsLoaded] = useState(false);
+  const [inventoryLoaded, setInventoryLoaded] = useState(false);
+  const [transactionsLoaded, setTransactionsLoaded] = useState(false);
+
+  const [search, setSearch] = useState("");
   const [error, setError] = useState("");
   const [success, setSuccess] = useState("");
-  const [search, setSearch] = useState("");
-  const [categoryFilter, setCategoryFilter] = useState("All");
-  const [stockFilter, setStockFilter] = useState("All");
-  const [showForm, setShowForm] = useState(false);
-  const [editingId, setEditingId] = useState(null);
-  const [form, setForm] = useState(EMPTY_FORM);
 
-  // Listen for real-time changes in Firestore.
+  const [saving, setSaving] = useState(false);
+  const [processingId, setProcessingId] = useState("");
+
+  const [showResourceForm, setShowResourceForm] = useState(false);
+  const [showIssueForm, setShowIssueForm] = useState(false);
+
+  // A non-null value means the resource modal is editing an existing item.
+  const [editingResource, setEditingResource] = useState(null);
+
+  const [resourceForm, setResourceForm] = useState(emptyResourceForm);
+  const [issueForm, setIssueForm] = useState(emptyIssueForm);
+
+  // --------------------------------------------------
+  // FIRESTORE LISTENERS
+  // --------------------------------------------------
+
   useEffect(() => {
-    const unsubscribe = onSnapshot(
-      collection(db, "resources"),
-      (snapshot) => {
-        const items = snapshot.docs.map((item) => ({
-          id: item.id,
-          ...item.data(),
-        }));
+    if (authLoading) return;
 
-        setResources(items);
-        setLoading(false);
+    if (!user || !adminAllowed) {
+      setLoading(false);
+      return;
+    }
+
+    setLoading(true);
+
+    const unsubscribers = [];
+
+    const inventoryUnsubscribe = onSnapshot(
+      collection(db, "resourceInventory"),
+      (snapshot) => {
+        setInventory(
+          snapshot.docs
+            .map((item) => ({
+              id: item.id,
+              ...item.data(),
+            }))
+            .sort((a, b) =>
+              String(a.name || "").localeCompare(String(b.name || ""))
+            )
+        );
+
+        setInventoryLoaded(true);
       },
       (err) => {
-        console.error("Resources subscription failed:", err);
-        setError("Could not load resources. Check your connection and permissions.");
-        setLoading(false);
+        console.error("Inventory listener error:", err);
+
+        setError(
+          "Unable to load inventory. Check your Firestore permissions."
+        );
+
+        setInventoryLoaded(true);
       }
     );
 
-    return () => unsubscribe();
-  }, []);
-
-  // Inventory totals.
-  const stats = useMemo(() => {
-    const totalItems = resources.length;
-
-    const totalQuantity = resources.reduce(
-      (sum, item) => sum + (Number(item.quantity) || 0),
-      0
+    const workersUnsubscribe = onSnapshot(
+      collection(db, "workers"),
+      (snapshot) => {
+        setWorkers(
+          snapshot.docs.map((item) => ({
+            id: item.id,
+            ...item.data(),
+          }))
+        );
+      },
+      (err) => {
+        console.error("Workers listener error:", err);
+      }
     );
 
-    const lowStock = resources.filter((item) => {
-      const quantity = Number(item.quantity) || 0;
-      const minimum = Number(item.minStock) || 0;
-      return quantity > 0 && quantity <= minimum;
-    }).length;
+    const requestsUnsubscribe = onSnapshot(
+      collection(db, "resourceRequests"),
+      (snapshot) => {
+        setRequests(
+          snapshot.docs
+            .map((item) => ({
+              id: item.id,
+              ...item.data(),
+            }))
+            .sort(
+              (a, b) =>
+                getDateValue(b.createdAt || b.requestedAt) -
+                getDateValue(a.createdAt || a.requestedAt)
+            )
+        );
 
-    const outOfStock = resources.filter(
-      (item) => (Number(item.quantity) || 0) <= 0
-    ).length;
+        setRequestsLoaded(true);
+      },
+      (err) => {
+        console.error("Resource requests listener error:", err);
 
-    const stockValue = resources.reduce(
-      (sum, item) =>
-        sum +
-        (Number(item.quantity) || 0) *
-          (Number(item.unitCost) || 0),
-      0
+        setError(
+          "Unable to load resource requests. Check your Firestore permissions."
+        );
+
+        setRequestsLoaded(true);
+      }
     );
 
-    return {
-      totalItems,
-      totalQuantity,
-      lowStock,
-      outOfStock,
-      stockValue,
+    const transactionsUnsubscribe = onSnapshot(
+      collection(db, "resourceTransactions"),
+      (snapshot) => {
+        setTransactions(
+          snapshot.docs
+            .map((item) => ({
+              id: item.id,
+              ...item.data(),
+            }))
+            .sort(
+              (a, b) =>
+                getDateValue(b.createdAt || b.transactionDate) -
+                getDateValue(a.createdAt || a.transactionDate)
+            )
+        );
+
+        setTransactionsLoaded(true);
+      },
+      (err) => {
+        console.error("Transactions listener error:", err);
+
+        setError("Unable to load transaction history.");
+
+        setTransactionsLoaded(true);
+      }
+    );
+
+    unsubscribers.push(
+      inventoryUnsubscribe,
+      workersUnsubscribe,
+      requestsUnsubscribe,
+      transactionsUnsubscribe
+    );
+
+    return () => {
+      unsubscribers.forEach((unsubscribe) => unsubscribe());
     };
-  }, [resources]);
+  }, [authLoading, user, adminAllowed]);
 
-  // Search and filter inventory.
-  const filteredResources = useMemo(() => {
-    return resources
-      .filter((item) => {
-        const searchText = search.trim().toLowerCase();
+  useEffect(() => {
+    if (
+      !authLoading &&
+      (!user ||
+        !adminAllowed ||
+        (inventoryLoaded && requestsLoaded && transactionsLoaded))
+    ) {
+      setLoading(false);
+    }
+  }, [
+    authLoading,
+    user,
+    adminAllowed,
+    inventoryLoaded,
+    requestsLoaded,
+    transactionsLoaded,
+  ]);
 
-        const matchesSearch =
-          !searchText ||
-          [
-            item.name,
-            item.category,
-            item.location,
-            item.notes,
-          ].some((value) =>
-            String(value || "").toLowerCase().includes(searchText)
-          );
+  // --------------------------------------------------
+  // FILTERED DATA AND SUMMARY
+  // --------------------------------------------------
 
-        const matchesCategory =
-          categoryFilter === "All" ||
-          item.category === categoryFilter;
+  const pendingRequests = useMemo(
+    () =>
+      requests.filter((request) =>
+        ["pending", "requested"].includes(getStatus(request))
+      ),
+    [requests]
+  );
 
-        const quantity = Number(item.quantity) || 0;
-        const minimum = Number(item.minStock) || 0;
+  const approvedRequests = useMemo(
+    () =>
+      requests.filter(
+        (request) => getStatus(request) === "approved"
+      ),
+    [requests]
+  );
 
-        let matchesStock = true;
+  const lowStockItems = useMemo(
+    () =>
+      inventory.filter(
+        (item) =>
+          Number(item.quantity || 0) <=
+          Number(item.minimumStock || 0)
+      ),
+    [inventory]
+  );
 
-        if (stockFilter === "In stock") {
-          matchesStock = quantity > minimum && quantity > 0;
-        } else if (stockFilter === "Low stock") {
-          matchesStock = quantity > 0 && quantity <= minimum;
-        } else if (stockFilter === "Out of stock") {
-          matchesStock = quantity <= 0;
-        }
+  const filteredRequests = useMemo(() => {
+    const term = search.trim().toLowerCase();
 
-        return matchesSearch && matchesCategory && matchesStock;
-      })
-      .sort((a, b) =>
-        String(a.name || "").localeCompare(String(b.name || ""))
-      );
-  }, [resources, search, categoryFilter, stockFilter]);
+    if (!term) return requests;
 
-  const openAddForm = () => {
-    setEditingId(null);
-    setForm(EMPTY_FORM);
+    return requests.filter((request) =>
+      [
+        getWorkerName(request, workers),
+        getResourceName(request),
+        request.reason,
+        request.purpose,
+        request.description,
+        getStatus(request),
+      ].some((value) =>
+        String(value || "").toLowerCase().includes(term)
+      )
+    );
+  }, [requests, workers, search]);
+
+  const filteredInventory = useMemo(() => {
+    const term = search.trim().toLowerCase();
+
+    if (!term) return inventory;
+
+    return inventory.filter((item) =>
+      [
+        item.name,
+        item.category,
+        item.unit,
+        item.description,
+      ].some((value) =>
+        String(value || "").toLowerCase().includes(term)
+      )
+    );
+  }, [inventory, search]);
+
+  const filteredTransactions = useMemo(() => {
+    const term = search.trim().toLowerCase();
+
+    if (!term) return transactions;
+
+    return transactions.filter((item) =>
+      [
+        item.resourceName,
+        item.recipientName,
+        item.workerName,
+        item.action,
+        item.type,
+        item.purpose,
+        item.notes,
+      ].some((value) =>
+        String(value || "").toLowerCase().includes(term)
+      )
+    );
+  }, [transactions, search]);
+
+  function notifySuccess(message) {
+    setSuccess(message);
+    setError("");
+  }
+
+  function notifyError(message) {
+    setError(message);
+    setSuccess("");
+  }
+
+  function closeFeedback() {
     setError("");
     setSuccess("");
-    setShowForm(true);
-  };
+  }
 
-  const openEditForm = (resource) => {
-    setEditingId(resource.id);
-    setForm({
-      name: resource.name || "",
-      category: resource.category || "Other",
-      quantity: String(resource.quantity ?? ""),
-      unit: resource.unit || "pieces",
-      unitCost: String(resource.unitCost ?? ""),
-      minStock: String(resource.minStock ?? ""),
-      location: resource.location || "",
-      notes: resource.notes || "",
+  function adminId() {
+    return user?.uid || "";
+  }
+
+  // --------------------------------------------------
+  // OPEN THE RESOURCE FORM
+  // --------------------------------------------------
+
+  function startAddingResource() {
+    closeFeedback();
+    setEditingResource(null);
+    setResourceForm({ ...emptyResourceForm });
+    setShowResourceForm(true);
+  }
+
+  function startEditingResource(item) {
+    closeFeedback();
+
+    setEditingResource(item);
+
+    setResourceForm({
+      name: item.name || "",
+      category: item.category || "Tools",
+      unit: item.unit || "pieces",
+      quantity: String(item.quantity ?? 0),
+      minimumStock: String(item.minimumStock ?? 0),
+      unitCost: String(item.unitCost ?? 0),
+      description: item.description || "",
     });
 
-    setError("");
-    setSuccess("");
-    setShowForm(true);
-  };
+    setShowResourceForm(true);
+  }
 
-  const closeForm = () => {
-    if (saving) return;
+  function closeResourceForm() {
+    setShowResourceForm(false);
+    setEditingResource(null);
+    setResourceForm({ ...emptyResourceForm });
+  }
 
-    setShowForm(false);
-    setEditingId(null);
-    setForm(EMPTY_FORM);
-  };
+  // --------------------------------------------------
+  // APPROVE OR REJECT A REQUEST
+  // --------------------------------------------------
 
-  const handleChange = (event) => {
-    const { name, value } = event.target;
+  async function decideRequest(request, nextStatus) {
+    if (!["pending", "requested"].includes(getStatus(request))) {
+      notifyError("This request has already been reviewed.");
+      return;
+    }
 
-    setForm((previous) => ({
-      ...previous,
-      [name]: value,
-    }));
-  };
+    setProcessingId(request.id);
+    closeFeedback();
 
-  const handleSave = async (event) => {
+    try {
+      const requestRef = doc(db, "resourceRequests", request.id);
+
+      await runTransaction(db, async (transaction) => {
+        const snapshot = await transaction.get(requestRef);
+
+        if (!snapshot.exists()) {
+          throw new Error("This request no longer exists.");
+        }
+
+        const current = snapshot.data();
+
+        if (!["pending", "requested"].includes(getStatus(current))) {
+          throw new Error("This request has already been reviewed.");
+        }
+
+        const updates = {
+          status: nextStatus,
+          requestStatus: nextStatus,
+          reviewedAt: serverTimestamp(),
+          reviewedBy: adminId(),
+          updatedAt: serverTimestamp(),
+        };
+
+        if (nextStatus === "approved") {
+          updates.approvedAt = serverTimestamp();
+          updates.approvedBy = adminId();
+        } else {
+          updates.rejectedAt = serverTimestamp();
+          updates.rejectedBy = adminId();
+        }
+
+        transaction.update(requestRef, updates);
+      });
+
+      notifySuccess(
+        nextStatus === "approved"
+          ? "Request approved. You can now issue the resource."
+          : "Resource request rejected."
+      );
+    } catch (err) {
+      console.error("Request review error:", err);
+      notifyError(err.message || "Unable to update this request.");
+    } finally {
+      setProcessingId("");
+    }
+  }
+
+  // --------------------------------------------------
+  // ISSUE AN APPROVED REQUEST
+  // --------------------------------------------------
+
+  async function issueApprovedRequest(request) {
+    if (getStatus(request) !== "approved") {
+      notifyError("Approve this request before issuing the resource.");
+      return;
+    }
+
+    const item = findInventoryItem(request, inventory);
+    const quantity = getQuantity(request);
+
+    if (!item) {
+      notifyError(
+        `No inventory item matches "${getResourceName(
+          request
+        )}". Check that the request references the correct resource.`
+      );
+      return;
+    }
+
+    if (!Number.isFinite(quantity) || quantity <= 0) {
+      notifyError("The requested quantity is invalid.");
+      return;
+    }
+
+    setProcessingId(request.id);
+    closeFeedback();
+
+    try {
+      const requestRef = doc(db, "resourceRequests", request.id);
+
+      const inventoryRef = doc(
+        db,
+        "resourceInventory",
+        item.id
+      );
+
+      const transactionRef = doc(
+        collection(db, "resourceTransactions")
+      );
+
+      await runTransaction(db, async (transaction) => {
+        const requestSnapshot = await transaction.get(requestRef);
+        const inventorySnapshot = await transaction.get(inventoryRef);
+
+        if (!requestSnapshot.exists()) {
+          throw new Error("This request no longer exists.");
+        }
+
+        if (!inventorySnapshot.exists()) {
+          throw new Error("The inventory item no longer exists.");
+        }
+
+        const latestRequest = requestSnapshot.data();
+        const latestItem = inventorySnapshot.data();
+
+        if (getStatus(latestRequest) !== "approved") {
+          throw new Error(
+            "This request is not approved or has already been issued."
+          );
+        }
+
+        const requestedQuantity = getQuantity(latestRequest);
+        const availableQuantity = Number(latestItem.quantity || 0);
+
+        if (
+          !Number.isFinite(requestedQuantity) ||
+          requestedQuantity <= 0
+        ) {
+          throw new Error("The requested quantity is invalid.");
+        }
+
+        if (availableQuantity < requestedQuantity) {
+          throw new Error(
+            `Insufficient stock. Only ${availableQuantity} available.`
+          );
+        }
+
+        const requesterName = getWorkerName(latestRequest, workers);
+
+        const workerId =
+          latestRequest.workerId ||
+          latestRequest.requesterId ||
+          latestRequest.userId ||
+          "";
+
+        transaction.update(inventoryRef, {
+          quantity: availableQuantity - requestedQuantity,
+          updatedAt: serverTimestamp(),
+          updatedBy: adminId(),
+        });
+
+        transaction.update(requestRef, {
+          status: "fulfilled",
+          requestStatus: "fulfilled",
+          fulfilledAt: serverTimestamp(),
+          issuedAt: serverTimestamp(),
+          issuedBy: adminId(),
+          updatedAt: serverTimestamp(),
+          inventoryId: item.id,
+          resourceId: item.id,
+        });
+
+        transaction.set(transactionRef, {
+          resourceId: item.id,
+          inventoryId: item.id,
+          resourceName: latestItem.name || item.name,
+          category: latestItem.category || "General",
+          unit: latestItem.unit || "pieces",
+          quantity: requestedQuantity,
+          type: "issue",
+          action: "issued",
+          direction: "out",
+          recipientType: "worker",
+          recipientId: workerId,
+          workerId,
+          workerName: requesterName,
+          recipientName: requesterName,
+          requestId: request.id,
+          purpose:
+            latestRequest.reason ||
+            latestRequest.purpose ||
+            latestRequest.description ||
+            "Approved resource request",
+          notes: "Issued from an approved resource request.",
+          createdAt: serverTimestamp(),
+          createdBy: adminId(),
+          source: "resource_request",
+        });
+      });
+
+      notifySuccess(
+        `Resource issued to ${getWorkerName(request, workers)}.`
+      );
+    } catch (err) {
+      console.error("Issue approved resource error:", err);
+      notifyError(err.message || "Unable to issue the resource.");
+    } finally {
+      setProcessingId("");
+    }
+  }
+
+  // --------------------------------------------------
+  // ADD OR EDIT A RESOURCE
+  // --------------------------------------------------
+
+  async function saveResource(event) {
     event.preventDefault();
 
-    setError("");
-    setSuccess("");
+    const name = resourceForm.name.trim();
+    const quantity = Number(resourceForm.quantity);
+    const minimumStock = Number(resourceForm.minimumStock);
+    const unitCost = Number(resourceForm.unitCost);
 
-    const quantity = Number(form.quantity);
-    const unitCost = Number(form.unitCost);
-    const minStock = Number(form.minStock);
-
-    if (!form.name.trim()) {
-      setError("Enter the resource name.");
+    if (!name) {
+      notifyError("Enter a resource name.");
       return;
     }
 
     if (
-      form.quantity === "" ||
       !Number.isFinite(quantity) ||
-      quantity < 0
-    ) {
-      setError("Enter a valid quantity of zero or more.");
-      return;
-    }
-
-    if (
-      form.unitCost === "" ||
+      quantity < 0 ||
+      !Number.isFinite(minimumStock) ||
+      minimumStock < 0 ||
       !Number.isFinite(unitCost) ||
       unitCost < 0
     ) {
-      setError("Enter a valid unit cost of zero or more.");
+      notifyError(
+        "Enter valid, non-negative quantity, minimum stock, and cost values."
+      );
       return;
     }
 
-    if (
-      form.minStock === "" ||
-      !Number.isFinite(minStock) ||
-      minStock < 0
-    ) {
-      setError("Enter a valid minimum stock level.");
+    const isEditing = Boolean(editingResource);
+
+    setSaving(true);
+    closeFeedback();
+
+    try {
+      const resourceRef = isEditing
+        ? doc(db, "resourceInventory", editingResource.id)
+        : doc(collection(db, "resourceInventory"));
+
+      const transactionRef = doc(
+        collection(db, "resourceTransactions")
+      );
+
+      await runTransaction(db, async (transaction) => {
+        if (isEditing) {
+          // Read the latest version so we can record the stock adjustment.
+          const resourceSnapshot = await transaction.get(resourceRef);
+
+          if (!resourceSnapshot.exists()) {
+            throw new Error("This resource no longer exists.");
+          }
+
+          const previousResource = resourceSnapshot.data();
+          const previousQuantity = Number(previousResource.quantity || 0);
+
+          transaction.update(resourceRef, {
+            name,
+            category: resourceForm.category,
+            unit: resourceForm.unit,
+            quantity,
+            minimumStock,
+            unitCost,
+            description: resourceForm.description.trim(),
+            updatedAt: serverTimestamp(),
+            updatedBy: adminId(),
+          });
+
+          // A quantity change gets its own transaction-history record.
+          if (quantity !== previousQuantity) {
+            const quantityDifference = Math.abs(
+              quantity - previousQuantity
+            );
+
+            transaction.set(transactionRef, {
+              resourceId: resourceRef.id,
+              inventoryId: resourceRef.id,
+              resourceName: name,
+              category: resourceForm.category,
+              unit: resourceForm.unit,
+              quantity: quantityDifference,
+              type: "adjustment",
+              action: "stock_adjustment",
+              direction:
+                quantity > previousQuantity ? "in" : "out",
+              purpose: "Manual inventory quantity adjustment",
+              notes: `Available quantity changed from ${previousQuantity} to ${quantity}.`,
+              previousQuantity,
+              newQuantity: quantity,
+              createdAt: serverTimestamp(),
+              createdBy: adminId(),
+              source: "admin_inventory_edit",
+            });
+          }
+        } else {
+          // Create a new inventory resource.
+          transaction.set(resourceRef, {
+            name,
+            category: resourceForm.category,
+            unit: resourceForm.unit,
+            quantity,
+            minimumStock,
+            unitCost,
+            description: resourceForm.description.trim(),
+            trackingType: "quantity",
+            createdAt: serverTimestamp(),
+            updatedAt: serverTimestamp(),
+            createdBy: adminId(),
+            updatedBy: adminId(),
+          });
+
+          transaction.set(transactionRef, {
+            resourceId: resourceRef.id,
+            inventoryId: resourceRef.id,
+            resourceName: name,
+            category: resourceForm.category,
+            unit: resourceForm.unit,
+            quantity,
+            type: "stock",
+            action: "stock_added",
+            direction: "in",
+            purpose: "Initial inventory entry",
+            notes: "Resource added to inventory.",
+            createdAt: serverTimestamp(),
+            createdBy: adminId(),
+            source: "admin_inventory",
+          });
+        }
+      });
+
+      setResourceForm({ ...emptyResourceForm });
+      setEditingResource(null);
+      setShowResourceForm(false);
+
+      notifySuccess(
+        isEditing
+          ? `${name} updated successfully.`
+          : `${name} added to inventory.`
+      );
+    } catch (err) {
+      console.error("Save resource error:", err);
+      notifyError(err.message || "Unable to save this resource.");
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  // --------------------------------------------------
+  // MANUALLY ISSUE A RESOURCE
+  // --------------------------------------------------
+
+  async function issueManually(event) {
+    event.preventDefault();
+
+    const item = inventory.find(
+      (resource) => resource.id === issueForm.resourceId
+    );
+
+    const quantity = Number(issueForm.quantity);
+
+    if (!item) {
+      notifyError("Select a resource.");
       return;
     }
 
-    if (!form.unit.trim()) {
-      setError("Enter the measurement unit.");
+    if (!Number.isFinite(quantity) || quantity <= 0) {
+      notifyError("Enter a valid quantity.");
+      return;
+    }
+
+    let recipientId = "";
+    let recipientName = "";
+
+    if (issueForm.recipientType === "worker") {
+      const worker = workers.find(
+        (person) => person.id === issueForm.workerId
+      );
+
+      if (!worker) {
+        notifyError("Select a worker.");
+        return;
+      }
+
+      recipientId = worker.id;
+
+      recipientName =
+        worker.name ||
+        worker.fullName ||
+        [worker.firstName, worker.lastName].filter(Boolean).join(" ") ||
+        worker.email ||
+        "Worker";
+    } else {
+      recipientName = issueForm.recipientName.trim();
+
+      if (!recipientName) {
+        notifyError("Enter the recipient's name.");
+        return;
+      }
+    }
+
+    if (quantity > Number(item.quantity || 0)) {
+      notifyError(
+        `Insufficient stock. Only ${item.quantity || 0} available.`
+      );
       return;
     }
 
     setSaving(true);
+    closeFeedback();
 
     try {
-      const resourceData = {
-        name: form.name.trim(),
-        category: form.category,
-        quantity,
-        unit: form.unit.trim(),
-        unitCost,
-        minStock,
-        location: form.location.trim(),
-        notes: form.notes.trim(),
-        updatedAt: serverTimestamp(),
-      };
+      const inventoryRef = doc(
+        db,
+        "resourceInventory",
+        item.id
+      );
 
-      if (editingId) {
-        await updateDoc(doc(db, "resources", editingId), resourceData);
-        setSuccess("Resource updated successfully.");
-      } else {
-        await addDoc(collection(db, "resources"), {
-          ...resourceData,
-          createdAt: serverTimestamp(),
+      const transactionRef = doc(
+        collection(db, "resourceTransactions")
+      );
+
+      await runTransaction(db, async (transaction) => {
+        const snapshot = await transaction.get(inventoryRef);
+
+        if (!snapshot.exists()) {
+          throw new Error("The inventory item no longer exists.");
+        }
+
+        const current = snapshot.data();
+        const available = Number(current.quantity || 0);
+
+        if (available < quantity) {
+          throw new Error(
+            `Insufficient stock. Only ${available} available.`
+          );
+        }
+
+        transaction.update(inventoryRef, {
+          quantity: available - quantity,
+          updatedAt: serverTimestamp(),
+          updatedBy: adminId(),
         });
-        setSuccess("Resource added successfully.");
-      }
 
-      setShowForm(false);
-      setEditingId(null);
-      setForm(EMPTY_FORM);
+        transaction.set(transactionRef, {
+          resourceId: item.id,
+          inventoryId: item.id,
+          resourceName: current.name || item.name,
+          category: current.category || item.category || "General",
+          unit: current.unit || item.unit || "pieces",
+          quantity,
+          type: "issue",
+          action: "manually_issued",
+          direction: "out",
+          recipientType: issueForm.recipientType,
+          recipientId,
+          workerId:
+            issueForm.recipientType === "worker" ? recipientId : "",
+          workerName:
+            issueForm.recipientType === "worker" ? recipientName : "",
+          recipientName,
+          purpose: issueForm.purpose.trim() || "Manual resource issue",
+          notes: issueForm.notes.trim(),
+          createdAt: serverTimestamp(),
+          createdBy: adminId(),
+          source: "admin_manual_issue",
+        });
+      });
+
+      setIssueForm({ ...emptyIssueForm });
+      setShowIssueForm(false);
+
+      notifySuccess(`Resource issued to ${recipientName}.`);
     } catch (err) {
-      console.error("Saving resource failed:", err);
-      setError("Could not save the resource. Please try again.");
+      console.error("Manual issue error:", err);
+      notifyError(err.message || "Unable to issue the resource.");
     } finally {
       setSaving(false);
     }
-  };
+  }
 
-  const handleDelete = async (resource) => {
-    const confirmed = window.confirm(
-      `Delete "${resource.name}" from the inventory? This action cannot be undone.`
+  // --------------------------------------------------
+  // LOADING AND ACCESS STATES
+  // --------------------------------------------------
+
+  if (authLoading || loading) {
+    return (
+      <div className="flex min-h-[50vh] items-center justify-center">
+        <RefreshCw
+          className="animate-spin text-blue-700"
+          size={24}
+        />
+      </div>
     );
+  }
 
-    if (!confirmed) return;
+  if (!user || !adminAllowed) {
+    return (
+      <div className="mx-auto mt-12 max-w-md rounded-xl border border-slate-200 bg-white p-8 text-center">
+        <ShieldCheck
+          className="mx-auto text-slate-400"
+          size={32}
+        />
 
-    setError("");
-    setSuccess("");
+        <h1 className="mt-3 font-semibold text-slate-900">
+          Admin access required
+        </h1>
 
-    try {
-      await deleteDoc(doc(db, "resources", resource.id));
-      setSuccess(`${resource.name} was deleted.`);
-    } catch (err) {
-      console.error("Deleting resource failed:", err);
-      setError("Could not delete this resource. Check your permissions.");
-    }
-  };
+        <p className="mt-1 text-sm text-slate-500">
+          Sign in with an administrator account to manage resources.
+        </p>
+      </div>
+    );
+  }
+
+  // --------------------------------------------------
+  // PAGE UI
+  // --------------------------------------------------
 
   return (
-    <div className="min-h-screen bg-[#F5F8FC] px-4 py-6 text-[#172033] sm:px-6 lg:px-8">
-      <div className="mx-auto max-w-7xl space-y-7">
-        {/* Page heading */}
+    <div className="min-h-screen bg-slate-50/70 px-4 py-5 sm:px-6 lg:px-8">
+      <div className="mx-auto max-w-7xl space-y-5">
+        {/* Page header */}
         <div className="flex flex-col justify-between gap-4 sm:flex-row sm:items-center">
           <div>
-            <p className="text-sm font-medium text-[#1769E0]">
-              Inventory Management
-            </p>
+            <div className="flex items-center gap-2 text-sm font-medium text-blue-700">
+              <Boxes size={17} />
+              Operations
+            </div>
 
-            <h1 className="mt-1 text-2xl font-bold tracking-tight sm:text-3xl">
+            <h1 className="mt-1 text-2xl font-bold tracking-tight text-slate-900">
               Resources
             </h1>
 
-            <p className="mt-2 max-w-2xl text-sm leading-6 text-[#667085]">
-              Track materials, tools, equipment, and stock levels for your
-              construction operations.
+            <p className="mt-1 text-sm text-slate-500">
+              Manage stock and review resource requests.
             </p>
           </div>
 
-          <button
-            onClick={openAddForm}
-            className="inline-flex items-center justify-center gap-2 rounded-xl bg-[#1769E0] px-5 py-3 text-sm font-semibold text-white shadow-sm transition hover:bg-[#1258BE]"
-          >
-            <Plus size={18} />
-            Add Resource
-          </button>
+          <div className="flex flex-wrap gap-2">
+            <button
+              type="button"
+              onClick={() => {
+                closeFeedback();
+                setShowIssueForm(true);
+              }}
+              className="inline-flex items-center gap-2 rounded-lg border border-slate-200 bg-white px-3.5 py-2.5 text-sm font-medium text-slate-700 hover:bg-slate-50"
+            >
+              <ArrowDownCircle size={16} />
+              Issue resource
+            </button>
+
+            <button
+              type="button"
+              onClick={startAddingResource}
+              className="inline-flex items-center gap-2 rounded-lg bg-blue-700 px-3.5 py-2.5 text-sm font-medium text-white hover:bg-blue-800"
+            >
+              <Plus size={16} />
+              Add resource
+            </button>
+          </div>
         </div>
 
-        {/* Notifications */}
+        {/* Feedback messages */}
         {error && (
-          <div
-            role="alert"
-            className="flex items-start gap-3 rounded-xl border border-red-200 bg-red-50 p-4 text-sm text-red-700"
-          >
-            <AlertTriangle size={19} className="mt-0.5 shrink-0" />
-            <span>{error}</span>
+          <div className="flex items-start gap-3 rounded-lg border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">
+            <AlertTriangle
+              size={18}
+              className="mt-0.5 shrink-0"
+            />
+
+            <p className="flex-1">{error}</p>
+
             <button
+              type="button"
               onClick={() => setError("")}
-              className="ml-auto"
               aria-label="Dismiss error"
             >
               <X size={17} />
@@ -386,554 +1168,933 @@ export default function ResourcesPage() {
         )}
 
         {success && (
-          <div
-            role="status"
-            className="flex items-center gap-3 rounded-xl border border-green-200 bg-green-50 p-4 text-sm text-green-700"
-          >
-            <CheckCircle2 size={19} />
-            <span>{success}</span>
+          <div className="flex items-start gap-3 rounded-lg border border-emerald-200 bg-emerald-50 px-4 py-3 text-sm text-emerald-700">
+            <CheckCircle2
+              size={18}
+              className="mt-0.5 shrink-0"
+            />
+
+            <p className="flex-1">{success}</p>
+
             <button
+              type="button"
               onClick={() => setSuccess("")}
-              className="ml-auto"
-              aria-label="Dismiss message"
+              aria-label="Dismiss success"
             >
               <X size={17} />
             </button>
           </div>
         )}
 
-        {/* Summary cards */}
-        <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-4">
+        {/* Overview */}
+        <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
           <SummaryCard
-            title="Resource Types"
-            value={stats.totalItems}
-            description="Unique inventory records"
-            icon={Boxes}
-            iconClass="bg-blue-50 text-blue-700"
+            icon={Clock3}
+            label="Pending requests"
+            value={pendingRequests.length}
+            note="Awaiting review"
           />
 
           <SummaryCard
-            title="Units in Stock"
-            value={stats.totalQuantity.toLocaleString()}
-            description="Combined quantities"
+            icon={CheckCircle2}
+            label="Ready to issue"
+            value={approvedRequests.length}
+            note="Approved requests"
+          />
+
+          <SummaryCard
             icon={Package}
-            iconClass="bg-indigo-50 text-indigo-700"
+            label="Inventory items"
+            value={inventory.length}
+            note="Resources tracked"
           />
 
           <SummaryCard
-            title="Low / Out of Stock"
-            value={stats.lowStock + stats.outOfStock}
-            description={`${stats.lowStock} low · ${stats.outOfStock} out of stock`}
             icon={AlertTriangle}
-            iconClass="bg-amber-50 text-amber-700"
-          />
-
-          <SummaryCard
-            title="Estimated Stock Value"
-            value={formatMoney(stats.stockValue)}
-            description="Quantity × recorded unit cost"
-            icon={CircleDollarSign}
-            iconClass="bg-green-50 text-green-700"
-            compact
+            label="Low stock"
+            value={lowStockItems.length}
+            note="At or below minimum"
           />
         </div>
 
-        {/* Stock alerts */}
-        {!loading && (stats.lowStock > 0 || stats.outOfStock > 0) && (
-          <div className="rounded-2xl border border-amber-200 bg-amber-50 p-4 sm:p-5">
-            <div className="flex items-start gap-3">
-              <div className="rounded-xl bg-white p-2 text-amber-700">
-                <AlertTriangle size={21} />
-              </div>
+        {/* Low stock notice */}
+        {lowStockItems.length > 0 && (
+          <div className="flex items-center gap-2 rounded-lg border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-800">
+            <AlertTriangle size={17} className="shrink-0" />
 
-              <div className="min-w-0">
-                <h2 className="font-semibold text-amber-900">
-                  Inventory needs attention
-                </h2>
+            <span>
+              <strong>Low stock:</strong>{" "}
+              {lowStockItems
+                .slice(0, 4)
+                .map((item) => item.name)
+                .join(", ")}
 
-                <p className="mt-1 text-sm leading-6 text-amber-800">
-                  {stats.outOfStock > 0 &&
-                    `${stats.outOfStock} resource type(s) are out of stock. `}
-                  {stats.lowStock > 0 &&
-                    `${stats.lowStock} resource type(s) have reached their minimum stock level.`}
-                </p>
-
-                <button
-                  onClick={() => setStockFilter("Low stock")}
-                  className="mt-3 text-sm font-semibold text-amber-900 underline underline-offset-4"
-                >
-                  View low-stock items
-                </button>
-
-                {stats.outOfStock > 0 && (
-                  <button
-                    onClick={() => setStockFilter("Out of stock")}
-                    className="ml-4 mt-3 text-sm font-semibold text-amber-900 underline underline-offset-4"
-                  >
-                    View out-of-stock items
-                  </button>
-                )}
-              </div>
-            </div>
+              {lowStockItems.length > 4
+                ? ` and ${lowStockItems.length - 4} more`
+                : ""}
+            </span>
           </div>
         )}
 
-        {/* Inventory table */}
-        <section className="overflow-hidden rounded-2xl border border-[#E5EDF5] bg-white shadow-sm">
-          <div className="border-b border-[#E5EDF5] p-5 sm:p-6">
-            <div className="flex flex-col justify-between gap-4 lg:flex-row lg:items-center">
+        {/* Tabs and search */}
+        <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+          <div className="flex w-fit max-w-full gap-1 overflow-x-auto rounded-lg border border-slate-200 bg-white p-1">
+            {tabs.map(({ id, label, icon: Icon }) => (
+              <button
+                key={id}
+                type="button"
+                onClick={() => {
+                  setActiveTab(id);
+                  setSearch("");
+                  closeFeedback();
+                }}
+                className={`inline-flex shrink-0 items-center gap-2 rounded-md px-3 py-2 text-sm font-medium transition ${
+                  activeTab === id
+                    ? "bg-blue-700 text-white shadow-sm"
+                    : "text-slate-600 hover:bg-slate-100"
+                }`}
+              >
+                <Icon size={16} />
+                {label}
+
+                {id === "requests" && pendingRequests.length > 0 && (
+                  <span
+                    className={`rounded-full px-1.5 py-0.5 text-xs ${
+                      activeTab === id
+                        ? "bg-white/20 text-white"
+                        : "bg-amber-100 text-amber-800"
+                    }`}
+                  >
+                    {pendingRequests.length}
+                  </span>
+                )}
+              </button>
+            ))}
+          </div>
+
+          <div className="relative w-full sm:max-w-xs">
+            <Search
+              size={17}
+              className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-400"
+            />
+
+            <input
+              value={search}
+              onChange={(event) => setSearch(event.target.value)}
+              placeholder={
+                activeTab === "requests"
+                  ? "Search requests..."
+                  : activeTab === "inventory"
+                  ? "Search inventory..."
+                  : "Search history..."
+              }
+              className={`${inputClass} pl-9`}
+            />
+          </div>
+        </div>
+
+        {/* ============================================= */}
+        {/* REQUESTS TAB                                  */}
+        {/* ============================================= */}
+
+        {activeTab === "requests" && (
+          <section className="overflow-hidden rounded-xl border border-slate-200 bg-white">
+            <div className="flex items-center justify-between border-b border-slate-100 px-4 py-3 sm:px-5">
               <div>
-                <h2 className="text-lg font-bold">Resource Inventory</h2>
-                <p className="mt-1 text-sm text-[#667085]">
-                  Manage your materials and equipment records.
+                <h2 className="font-semibold text-slate-900">
+                  Resource requests
+                </h2>
+
+                <p className="mt-0.5 text-xs text-slate-500">
+                  Review, approve, and issue requested items.
                 </p>
               </div>
 
-              <div className="flex flex-col gap-3 sm:flex-row">
-                <div className="relative">
-                  <Search
-                    size={18}
-                    className="absolute left-3 top-1/2 -translate-y-1/2 text-gray-400"
-                  />
+              <span className="text-xs text-slate-500">
+                {filteredRequests.length} total
+              </span>
+            </div>
 
+            {!requestsLoaded ? (
+              <div className="p-8 text-center text-sm text-slate-500">
+                Loading requests...
+              </div>
+            ) : filteredRequests.length === 0 ? (
+              <EmptyState
+                icon={Package}
+                title="No requests found"
+                description="Worker requests will appear here when they are submitted."
+              />
+            ) : (
+              <div className="divide-y divide-slate-100">
+                {filteredRequests.map((request) => {
+                  const status = getStatus(request);
+                  const workerName = getWorkerName(request, workers);
+                  const item = findInventoryItem(request, inventory);
+                  const quantity = getQuantity(request);
+                  const canReview = ["pending", "requested"].includes(status);
+                  const canIssue = status === "approved";
+                  const isProcessing = processingId === request.id;
+
+                  return (
+                    <div
+                      key={request.id}
+                      className="flex flex-col gap-3 px-4 py-4 transition hover:bg-slate-50/70 sm:px-5 lg:flex-row lg:items-center lg:justify-between"
+                    >
+                      <div className="flex min-w-0 items-start gap-3">
+                        <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg bg-blue-50 text-blue-700">
+                          <Package size={20} />
+                        </div>
+
+                        <div className="min-w-0 flex-1">
+                          <div className="flex flex-wrap items-center gap-2">
+                            <h3 className="font-semibold text-slate-900">
+                              {getResourceName(request)}
+                            </h3>
+
+                            <StatusBadge status={status} />
+                          </div>
+
+                          <p className="mt-1 flex flex-wrap items-center gap-1.5 text-sm text-slate-600">
+                            <UserRound
+                              size={14}
+                              className="shrink-0 text-slate-400"
+                            />
+
+                            {workerName}
+
+                            <span className="text-slate-300">·</span>
+
+                            {quantity}{" "}
+                            {request.unit || item?.unit || "units"}
+                          </p>
+
+                          {(request.reason ||
+                            request.purpose ||
+                            request.description) && (
+                            <p className="mt-1 max-w-2xl text-sm text-slate-500">
+                              {request.reason ||
+                                request.purpose ||
+                                request.description}
+                            </p>
+                          )}
+
+                          <div className="mt-1.5 flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-slate-400">
+                            <span>
+                              Requested{" "}
+                              {formatDate(
+                                request.createdAt || request.requestedAt
+                              )}
+                            </span>
+
+                            {item && (
+                              <span>
+                                Stock available: {item.quantity || 0}{" "}
+                                {item.unit || "units"}
+                              </span>
+                            )}
+
+                            {!item && (
+                              <span className="text-amber-700">
+                                No matching inventory item
+                              </span>
+                            )}
+                          </div>
+                        </div>
+                      </div>
+
+                      <div className="flex shrink-0 flex-wrap gap-2 pl-0 sm:pl-[52px] lg:pl-0">
+                        {canReview && (
+                          <>
+                            <button
+                              type="button"
+                              disabled={isProcessing}
+                              onClick={() =>
+                                decideRequest(request, "approved")
+                              }
+                              className="inline-flex items-center gap-1.5 rounded-lg bg-blue-700 px-3 py-2 text-sm font-medium text-white hover:bg-blue-800 disabled:opacity-50"
+                            >
+                              <Check size={15} />
+                              Approve
+                            </button>
+
+                            <button
+                              type="button"
+                              disabled={isProcessing}
+                              onClick={() =>
+                                decideRequest(request, "rejected")
+                              }
+                              className="inline-flex items-center gap-1.5 rounded-lg border border-slate-200 px-3 py-2 text-sm font-medium text-slate-600 hover:bg-slate-100 disabled:opacity-50"
+                            >
+                              <XCircle size={15} />
+                              Reject
+                            </button>
+                          </>
+                        )}
+
+                        {canIssue && (
+                          <button
+                            type="button"
+                            disabled={
+                              isProcessing ||
+                              !item ||
+                              quantity <= 0 ||
+                              quantity > Number(item?.quantity || 0)
+                            }
+                            onClick={() =>
+                              issueApprovedRequest(request)
+                            }
+                            className="inline-flex items-center gap-1.5 rounded-lg bg-emerald-600 px-3 py-2 text-sm font-medium text-white hover:bg-emerald-700 disabled:cursor-not-allowed disabled:opacity-50"
+                          >
+                            <ArrowDownCircle size={15} />
+                            Issue resource
+                          </button>
+                        )}
+
+                        {isProcessing && (
+                          <RefreshCw
+                            size={17}
+                            className="animate-spin self-center text-blue-700"
+                          />
+                        )}
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+          </section>
+        )}
+
+        {/* ============================================= */}
+        {/* INVENTORY TAB                                 */}
+        {/* ============================================= */}
+
+        {activeTab === "inventory" && (
+          <section className="overflow-hidden rounded-xl border border-slate-200 bg-white">
+            <div className="flex items-center justify-between border-b border-slate-100 px-4 py-3 sm:px-5">
+              <div>
+                <h2 className="font-semibold text-slate-900">
+                  Inventory
+                </h2>
+
+                <p className="mt-0.5 text-xs text-slate-500">
+                  View, edit, and manage available resources.
+                </p>
+              </div>
+
+              <button
+                type="button"
+                onClick={startAddingResource}
+                className="inline-flex items-center gap-1.5 rounded-lg bg-blue-700 px-3 py-2 text-sm font-medium text-white hover:bg-blue-800"
+              >
+                <Plus size={15} />
+                Add item
+              </button>
+            </div>
+
+            {filteredInventory.length === 0 ? (
+              <EmptyState
+                icon={Warehouse}
+                title="No inventory items"
+                description="Add a resource to start tracking company stock."
+              />
+            ) : (
+              <div className="divide-y divide-slate-100">
+                {filteredInventory.map((item) => {
+                  const quantity = Number(item.quantity || 0);
+                  const minimum = Number(item.minimumStock || 0);
+                  const low = quantity <= minimum;
+
+                  return (
+                    <div
+                      key={item.id}
+                      className="flex items-center gap-3 px-4 py-3.5 transition hover:bg-slate-50/70 sm:px-5"
+                    >
+                      <div className="rounded-lg bg-slate-100 p-2.5 text-slate-600">
+                        <Package size={19} />
+                      </div>
+
+                      <div className="min-w-0 flex-1">
+                        <p className="truncate text-sm font-semibold text-slate-900">
+                          {item.name || "Unnamed resource"}
+                        </p>
+
+                        <p className="mt-0.5 truncate text-xs text-slate-500">
+                          {item.category || "General"}
+
+                          {item.description
+                            ? ` · ${item.description}`
+                            : ""}
+                        </p>
+                      </div>
+
+                      <div className="text-right">
+                        <p className="text-sm font-semibold text-slate-900">
+                          {quantity}{" "}
+                          <span className="font-normal text-slate-500">
+                            {item.unit || "units"}
+                          </span>
+                        </p>
+
+                        <p className="mt-0.5 text-xs text-slate-500">
+                          {formatMoney(item.unitCost)} per unit
+                        </p>
+                      </div>
+
+                      <div className="hidden min-w-[90px] text-right sm:block">
+                        <span
+                          className={`inline-flex rounded-full px-2.5 py-1 text-xs font-medium ${
+                            low
+                              ? "bg-amber-50 text-amber-700"
+                              : "bg-emerald-50 text-emerald-700"
+                          }`}
+                        >
+                          {low ? "Low stock" : "In stock"}
+                        </span>
+
+                        <p className="mt-1 text-xs text-slate-400">
+                          Min. {minimum}
+                        </p>
+                      </div>
+
+                      <div className="hidden text-right md:block">
+                        <p className="text-xs text-slate-500">
+                          Total value
+                        </p>
+
+                        <p className="text-sm font-medium text-slate-800">
+                          {formatMoney(
+                            quantity * Number(item.unitCost || 0)
+                          )}
+                        </p>
+                      </div>
+
+                      {/* Edit resource button */}
+                      <button
+                        type="button"
+                        onClick={() => startEditingResource(item)}
+                        aria-label={`Edit ${item.name || "resource"}`}
+                        title="Edit resource"
+                        className="inline-flex shrink-0 items-center gap-1.5 rounded-lg border border-slate-200 bg-white px-2.5 py-2 text-sm font-medium text-slate-600 transition hover:border-blue-200 hover:bg-blue-50 hover:text-blue-700"
+                      >
+                        <Pencil size={15} />
+                        <span className="hidden sm:inline">Edit</span>
+                      </button>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+          </section>
+        )}
+
+        {/* ============================================= */}
+        {/* TRANSACTION HISTORY TAB                       */}
+        {/* ============================================= */}
+
+        {activeTab === "history" && (
+          <section className="overflow-hidden rounded-xl border border-slate-200 bg-white">
+            <div className="border-b border-slate-100 px-4 py-3 sm:px-5">
+              <h2 className="font-semibold text-slate-900">
+                Transaction history
+              </h2>
+
+              <p className="mt-0.5 text-xs text-slate-500">
+                Stock additions, adjustments, and resource issues.
+              </p>
+            </div>
+
+            {filteredTransactions.length === 0 ? (
+              <EmptyState
+                icon={History}
+                title="No transactions yet"
+                description="Resource issues and stock adjustments will appear here."
+              />
+            ) : (
+              <div className="divide-y divide-slate-100">
+                {filteredTransactions.map((item) => {
+                  const action = String(
+                    item.action || item.type || ""
+                  ).toLowerCase();
+
+                  const incoming =
+                    String(item.direction || "").toLowerCase() === "in" ||
+                    ["stock", "stock_added", "restock"].includes(action);
+
+                  return (
+                    <div
+                      key={item.id}
+                      className="flex items-start gap-3 px-4 py-3.5 sm:px-5"
+                    >
+                      <div
+                        className={`mt-0.5 rounded-lg p-2 ${
+                          incoming
+                            ? "bg-emerald-50 text-emerald-700"
+                            : "bg-blue-50 text-blue-700"
+                        }`}
+                      >
+                        {incoming ? (
+                          <ArrowUpCircle size={19} />
+                        ) : (
+                          <ArrowDownCircle size={19} />
+                        )}
+                      </div>
+
+                      <div className="min-w-0 flex-1">
+                        <div className="flex flex-wrap items-center gap-2">
+                          <p className="text-sm font-semibold text-slate-900">
+                            {item.resourceName || "Resource"}
+                          </p>
+
+                          <span
+                            className={`text-xs font-medium ${
+                              incoming
+                                ? "text-emerald-700"
+                                : "text-blue-700"
+                            }`}
+                          >
+                            {action === "stock_adjustment"
+                              ? "Stock adjustment"
+                              : item.action ||
+                                item.type ||
+                                (incoming ? "Stock added" : "Issued")}
+                          </span>
+                        </div>
+
+                        <p className="mt-1 text-sm text-slate-600">
+                          {incoming ? "+" : "−"}
+                          {Number(item.quantity || 0)}{" "}
+                          {item.unit || "units"}
+
+                          {item.recipientName || item.workerName
+                            ? ` · ${item.recipientName || item.workerName}`
+                            : ""}
+                        </p>
+
+                        {(item.purpose || item.notes) && (
+                          <p className="mt-1 text-xs text-slate-500">
+                            {item.purpose || item.notes}
+                          </p>
+                        )}
+
+                        {item.action === "stock_adjustment" &&
+                          item.previousQuantity !== undefined &&
+                          item.newQuantity !== undefined && (
+                            <p className="mt-1 text-xs text-slate-500">
+                              Quantity changed from {item.previousQuantity}{" "}
+                              to {item.newQuantity}.
+                            </p>
+                          )}
+                      </div>
+
+                      <p className="shrink-0 text-xs text-slate-400">
+                        {formatDate(
+                          item.createdAt || item.transactionDate
+                        )}
+                      </p>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+          </section>
+        )}
+
+        {/* Footer information */}
+        <div className="flex items-start gap-2.5 rounded-lg border border-blue-100 bg-blue-50/60 px-4 py-3 text-xs leading-5 text-blue-900">
+          <ShieldCheck
+            size={17}
+            className="mt-0.5 shrink-0"
+          />
+
+          <p>
+            <strong>Stock control:</strong> approving a request does not
+            change stock. Stock is updated when a resource is issued. Editing
+            the available quantity also creates a stock-adjustment record.
+          </p>
+        </div>
+      </div>
+
+      {/* =============================================== */}
+      {/* ADD / EDIT RESOURCE MODAL                       */}
+      {/* =============================================== */}
+
+      {showResourceForm && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center overflow-y-auto bg-slate-950/40 p-4">
+          <div className="my-6 w-full max-w-lg overflow-hidden rounded-xl bg-white shadow-xl">
+            <div className="flex items-center justify-between border-b border-slate-100 px-5 py-4">
+              <div>
+                <h2 className="font-semibold text-slate-900">
+                  {editingResource ? "Edit resource" : "Add resource"}
+                </h2>
+
+                <p className="mt-0.5 text-xs text-slate-500">
+                  {editingResource
+                    ? "Update this resource and its available stock."
+                    : "Enter the resource and starting stock."}
+                </p>
+              </div>
+
+              <button
+                type="button"
+                onClick={closeResourceForm}
+                className="rounded-lg p-2 text-slate-500 hover:bg-slate-100"
+                aria-label="Close resource form"
+              >
+                <X size={18} />
+              </button>
+            </div>
+
+            <form onSubmit={saveResource} className="space-y-4 p-5">
+              <FormField label="Resource name *">
+                <input
+                  required
+                  value={resourceForm.name}
+                  onChange={(event) =>
+                    setResourceForm((current) => ({
+                      ...current,
+                      name: event.target.value,
+                    }))
+                  }
+                  placeholder="e.g. Electrical cable"
+                  className={inputClass}
+                />
+              </FormField>
+
+              <div className="grid grid-cols-2 gap-3">
+                <FormField label="Category">
+                  <select
+                    value={resourceForm.category}
+                    onChange={(event) =>
+                      setResourceForm((current) => ({
+                        ...current,
+                        category: event.target.value,
+                      }))
+                    }
+                    className={inputClass}
+                  >
+                    <option>Tools</option>
+                    <option>Electrical Materials</option>
+                    <option>Safety Equipment</option>
+                    <option>Construction Materials</option>
+                    <option>Electronics</option>
+                    <option>Office Supplies</option>
+                    <option>Vehicles</option>
+                    <option>Other</option>
+                  </select>
+                </FormField>
+
+                <FormField label="Unit">
+                  <select
+                    value={resourceForm.unit}
+                    onChange={(event) =>
+                      setResourceForm((current) => ({
+                        ...current,
+                        unit: event.target.value,
+                      }))
+                    }
+                    className={inputClass}
+                  >
+                    <option value="pieces">Pieces</option>
+                    <option value="units">Units</option>
+                    <option value="boxes">Boxes</option>
+                    <option value="meters">Meters</option>
+                    <option value="rolls">Rolls</option>
+                    <option value="sets">Sets</option>
+                    <option value="pairs">Pairs</option>
+                    <option value="litres">Litres</option>
+                    <option value="bags">Bags</option>
+                  </select>
+                </FormField>
+
+                <FormField label="Available quantity *">
                   <input
-                    type="search"
-                    value={search}
-                    onChange={(event) => setSearch(event.target.value)}
-                    placeholder="Search resources..."
-                    className="w-full rounded-xl border border-[#DCE5EF] py-2.5 pl-10 pr-3 text-sm outline-none transition focus:border-[#1769E0] focus:ring-2 focus:ring-blue-100 sm:w-56"
+                    required
+                    type="number"
+                    min="0"
+                    step="any"
+                    value={resourceForm.quantity}
+                    onChange={(event) =>
+                      setResourceForm((current) => ({
+                        ...current,
+                        quantity: event.target.value,
+                      }))
+                    }
+                    className={inputClass}
                   />
-                </div>
+                </FormField>
 
-                <select
-                  value={categoryFilter}
-                  onChange={(event) => setCategoryFilter(event.target.value)}
-                  className="rounded-xl border border-[#DCE5EF] bg-white px-3 py-2.5 text-sm outline-none focus:border-[#1769E0]"
+                <FormField label="Minimum stock">
+                  <input
+                    type="number"
+                    min="0"
+                    step="any"
+                    value={resourceForm.minimumStock}
+                    onChange={(event) =>
+                      setResourceForm((current) => ({
+                        ...current,
+                        minimumStock: event.target.value,
+                      }))
+                    }
+                    className={inputClass}
+                  />
+                </FormField>
+
+                <div className="col-span-2">
+                  <FormField label="Unit cost (GHS)">
+                    <input
+                      type="number"
+                      min="0"
+                      step="0.01"
+                      value={resourceForm.unitCost}
+                      onChange={(event) =>
+                        setResourceForm((current) => ({
+                          ...current,
+                          unitCost: event.target.value,
+                        }))
+                      }
+                      className={inputClass}
+                    />
+                  </FormField>
+                </div>
+              </div>
+
+              <FormField label="Description (optional)">
+                <textarea
+                  rows={2}
+                  value={resourceForm.description}
+                  onChange={(event) =>
+                    setResourceForm((current) => ({
+                      ...current,
+                      description: event.target.value,
+                    }))
+                  }
+                  className={inputClass}
+                  placeholder="Additional details"
+                />
+              </FormField>
+
+              <div className="flex justify-end gap-2 border-t border-slate-100 pt-4">
+                <button
+                  type="button"
+                  onClick={closeResourceForm}
+                  disabled={saving}
+                  className="rounded-lg border border-slate-200 px-4 py-2.5 text-sm font-medium text-slate-700 hover:bg-slate-50 disabled:opacity-50"
                 >
-                  <option value="All">All categories</option>
-                  {CATEGORIES.map((category) => (
-                    <option key={category} value={category}>
-                      {category}
+                  Cancel
+                </button>
+
+                <button
+                  type="submit"
+                  disabled={saving}
+                  className="inline-flex items-center gap-2 rounded-lg bg-blue-700 px-4 py-2.5 text-sm font-medium text-white hover:bg-blue-800 disabled:opacity-50"
+                >
+                  {saving && (
+                    <RefreshCw size={15} className="animate-spin" />
+                  )}
+
+                  {saving
+                    ? "Saving..."
+                    : editingResource
+                    ? "Save changes"
+                    : "Add resource"}
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+
+      {/* =============================================== */}
+      {/* MANUAL ISSUE RESOURCE MODAL                     */}
+      {/* =============================================== */}
+
+      {showIssueForm && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center overflow-y-auto bg-slate-950/40 p-4">
+          <div className="my-6 w-full max-w-lg overflow-hidden rounded-xl bg-white shadow-xl">
+            <div className="flex items-center justify-between border-b border-slate-100 px-5 py-4">
+              <div>
+                <h2 className="font-semibold text-slate-900">
+                  Issue resource
+                </h2>
+
+                <p className="mt-0.5 text-xs text-slate-500">
+                  Record the recipient and update available stock.
+                </p>
+              </div>
+
+              <button
+                type="button"
+                onClick={() => setShowIssueForm(false)}
+                className="rounded-lg p-2 text-slate-500 hover:bg-slate-100"
+                aria-label="Close issue form"
+              >
+                <X size={18} />
+              </button>
+            </div>
+
+            <form onSubmit={issueManually} className="space-y-4 p-5">
+              <FormField label="Resource *">
+                <select
+                  required
+                  value={issueForm.resourceId}
+                  onChange={(event) =>
+                    setIssueForm((current) => ({
+                      ...current,
+                      resourceId: event.target.value,
+                    }))
+                  }
+                  className={inputClass}
+                >
+                  <option value="">Select resource</option>
+
+                  {inventory.map((item) => (
+                    <option key={item.id} value={item.id}>
+                      {item.name} — {item.quantity || 0}{" "}
+                      {item.unit || "units"} available
                     </option>
                   ))}
                 </select>
+              </FormField>
 
-                <select
-                  value={stockFilter}
-                  onChange={(event) => setStockFilter(event.target.value)}
-                  className="rounded-xl border border-[#DCE5EF] bg-white px-3 py-2.5 text-sm outline-none focus:border-[#1769E0]"
-                >
-                  <option value="All">All stock levels</option>
-                  <option value="In stock">In stock</option>
-                  <option value="Low stock">Low stock</option>
-                  <option value="Out of stock">Out of stock</option>
-                </select>
+              <div className="grid grid-cols-2 gap-3">
+                <FormField label="Quantity *">
+                  <input
+                    required
+                    type="number"
+                    min="0.01"
+                    step="any"
+                    value={issueForm.quantity}
+                    onChange={(event) =>
+                      setIssueForm((current) => ({
+                        ...current,
+                        quantity: event.target.value,
+                      }))
+                    }
+                    className={inputClass}
+                  />
+                </FormField>
+
+                <FormField label="Recipient type">
+                  <select
+                    value={issueForm.recipientType}
+                    onChange={(event) =>
+                      setIssueForm((current) => ({
+                        ...current,
+                        recipientType: event.target.value,
+                        workerId: "",
+                        recipientName: "",
+                      }))
+                    }
+                    className={inputClass}
+                  >
+                    <option value="worker">Company worker</option>
+                    <option value="external">Other person</option>
+                  </select>
+                </FormField>
               </div>
-            </div>
-          </div>
 
-          {loading ? (
-            <div className="flex min-h-64 items-center justify-center gap-3 text-sm text-[#667085]">
-              <Loader2 size={22} className="animate-spin text-[#1769E0]" />
-              Loading inventory...
-            </div>
-          ) : filteredResources.length === 0 ? (
-            <div className="flex min-h-72 flex-col items-center justify-center px-5 text-center">
-              <div className="rounded-2xl bg-[#EAF4FF] p-4 text-[#1769E0]">
-                <Package size={30} />
-              </div>
+              {issueForm.recipientType === "worker" ? (
+                <FormField label="Worker *">
+                  <select
+                    required
+                    value={issueForm.workerId}
+                    onChange={(event) =>
+                      setIssueForm((current) => ({
+                        ...current,
+                        workerId: event.target.value,
+                      }))
+                    }
+                    className={inputClass}
+                  >
+                    <option value="">Select worker</option>
 
-              <h3 className="mt-4 font-semibold">
-                {resources.length === 0
-                  ? "No resources added yet"
-                  : "No matching resources"}
-              </h3>
-
-              <p className="mt-2 max-w-sm text-sm leading-6 text-[#667085]">
-                {resources.length === 0
-                  ? "Start building your inventory by adding your first material or piece of equipment."
-                  : "Try changing your search or filters to find a resource."}
-              </p>
-
-              {resources.length === 0 && (
-                <button
-                  onClick={openAddForm}
-                  className="mt-5 inline-flex items-center gap-2 rounded-xl bg-[#1769E0] px-4 py-2.5 text-sm font-semibold text-white hover:bg-[#1258BE]"
-                >
-                  <Plus size={17} />
-                  Add your first resource
-                </button>
+                    {workers.map((worker) => (
+                      <option key={worker.id} value={worker.id}>
+                        {worker.name ||
+                          worker.fullName ||
+                          [worker.firstName, worker.lastName]
+                            .filter(Boolean)
+                            .join(" ") ||
+                          worker.email ||
+                          "Worker"}
+                      </option>
+                    ))}
+                  </select>
+                </FormField>
+              ) : (
+                <FormField label="Recipient name *">
+                  <input
+                    required
+                    value={issueForm.recipientName}
+                    onChange={(event) =>
+                      setIssueForm((current) => ({
+                        ...current,
+                        recipientName: event.target.value,
+                      }))
+                    }
+                    placeholder="Enter the person's name"
+                    className={inputClass}
+                  />
+                </FormField>
               )}
-            </div>
-          ) : (
-            <>
-              <div className="overflow-x-auto">
-                <table className="w-full min-w-[950px] text-left">
-                  <thead className="bg-[#F8FBFF] text-xs uppercase tracking-wide text-[#667085]">
-                    <tr>
-                      <th className="px-5 py-4 font-semibold">Resource</th>
-                      <th className="px-5 py-4 font-semibold">Category</th>
-                      <th className="px-5 py-4 font-semibold">Quantity</th>
-                      <th className="px-5 py-4 font-semibold">Unit Cost</th>
-                      <th className="px-5 py-4 font-semibold">Stock Value</th>
-                      <th className="px-5 py-4 font-semibold">Status</th>
-                      <th className="px-5 py-4 text-right font-semibold">Actions</th>
-                    </tr>
-                  </thead>
 
-                  <tbody className="divide-y divide-[#EDF1F6]">
-                    {filteredResources.map((resource) => {
-                      const status = getStockStatus(resource);
+              <FormField label="Purpose">
+                <input
+                  value={issueForm.purpose}
+                  onChange={(event) =>
+                    setIssueForm((current) => ({
+                      ...current,
+                      purpose: event.target.value,
+                    }))
+                  }
+                  placeholder="e.g. Electrical work at site"
+                  className={inputClass}
+                />
+              </FormField>
 
-                      const quantity = Number(resource.quantity) || 0;
-                      const unitCost = Number(resource.unitCost) || 0;
-                      const stockValue = quantity * unitCost;
+              <FormField label="Notes (optional)">
+                <textarea
+                  rows={2}
+                  value={issueForm.notes}
+                  onChange={(event) =>
+                    setIssueForm((current) => ({
+                      ...current,
+                      notes: event.target.value,
+                    }))
+                  }
+                  placeholder="Any additional details"
+                  className={inputClass}
+                />
+              </FormField>
 
-                      return (
-                        <tr
-                          key={resource.id}
-                          className="transition hover:bg-[#F8FBFF]"
-                        >
-                          <td className="px-5 py-4">
-                            <div className="flex items-center gap-3">
-                              <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-[#EAF4FF] text-[#1769E0]">
-                                <Package size={19} />
-                              </div>
-
-                              <div className="max-w-52">
-                                <p className="font-semibold text-[#172033]">
-                                  {resource.name}
-                                </p>
-
-                                <p className="mt-1 text-xs text-[#667085]">
-                                  {resource.location || "Location not specified"}
-                                </p>
-                              </div>
-                            </div>
-                          </td>
-
-                          <td className="px-5 py-4 text-sm text-[#475467]">
-                            {resource.category || "Other"}
-                          </td>
-
-                          <td className="px-5 py-4">
-                            <p className="font-semibold">
-                              {quantity.toLocaleString()}{" "}
-                              <span className="text-sm font-normal text-[#667085]">
-                                {resource.unit || "units"}
-                              </span>
-                            </p>
-
-                            <p className="mt-1 text-xs text-[#667085]">
-                              Minimum: {Number(resource.minStock) || 0}
-                            </p>
-                          </td>
-
-                          <td className="px-5 py-4 text-sm text-[#475467]">
-                            {formatMoney(unitCost)}
-                          </td>
-
-                          <td className="px-5 py-4 text-sm font-semibold">
-                            {formatMoney(stockValue)}
-                          </td>
-
-                          <td className="px-5 py-4">
-                            <span
-                              className={`inline-flex whitespace-nowrap rounded-full px-3 py-1.5 text-xs font-semibold ${status.className}`}
-                            >
-                              {status.label}
-                            </span>
-                          </td>
-
-                          <td className="px-5 py-4">
-                            <div className="flex justify-end gap-2">
-                              <button
-                                onClick={() => openEditForm(resource)}
-                                title="Edit resource"
-                                aria-label={`Edit ${resource.name}`}
-                                className="rounded-lg border border-[#DCE5EF] p-2 text-[#1769E0] transition hover:bg-[#EAF4FF]"
-                              >
-                                <Edit size={16} />
-                              </button>
-
-                              <button
-                                onClick={() => handleDelete(resource)}
-                                title="Delete resource"
-                                aria-label={`Delete ${resource.name}`}
-                                className="rounded-lg border border-red-100 p-2 text-red-600 transition hover:bg-red-50"
-                              >
-                                <Trash2 size={16} />
-                              </button>
-                            </div>
-                          </td>
-                        </tr>
-                      );
-                    })}
-                  </tbody>
-                </table>
-              </div>
-
-              <div className="border-t border-[#E5EDF5] px-5 py-4 text-sm text-[#667085]">
-                Showing {filteredResources.length} of {resources.length} resource
-                {resources.length === 1 ? "" : "s"}
-              </div>
-            </>
-          )}
-        </section>
-
-        {/* Add / Edit form */}
-        {showForm && (
-          <div className="fixed inset-0 z-50 flex items-start justify-center overflow-y-auto bg-slate-950/40 p-4 py-8 backdrop-blur-[2px] sm:items-center">
-            <div
-              role="dialog"
-              aria-modal="true"
-              aria-labelledby="resource-form-title"
-              className="my-auto w-full max-w-2xl rounded-2xl bg-white shadow-2xl"
-            >
-              <div className="flex items-start justify-between border-b border-[#E5EDF5] p-5 sm:p-6">
-                <div>
-                  <h2
-                    id="resource-form-title"
-                    className="text-xl font-bold"
-                  >
-                    {editingId ? "Edit Resource" : "Add New Resource"}
-                  </h2>
-
-                  <p className="mt-1 text-sm text-[#667085]">
-                    Enter the resource details for your inventory.
-                  </p>
-                </div>
+              <div className="flex justify-end gap-2 border-t border-slate-100 pt-4">
+                <button
+                  type="button"
+                  onClick={() => setShowIssueForm(false)}
+                  disabled={saving}
+                  className="rounded-lg border border-slate-200 px-4 py-2.5 text-sm font-medium text-slate-700 hover:bg-slate-50 disabled:opacity-50"
+                >
+                  Cancel
+                </button>
 
                 <button
-                  onClick={closeForm}
-                  disabled={saving}
-                  aria-label="Close form"
-                  className="rounded-lg p-2 text-[#667085] hover:bg-gray-100 disabled:opacity-50"
+                  type="submit"
+                  disabled={saving || inventory.length === 0}
+                  className="inline-flex items-center gap-2 rounded-lg bg-blue-700 px-4 py-2.5 text-sm font-medium text-white hover:bg-blue-800 disabled:opacity-50"
                 >
-                  <X size={20} />
+                  {saving && (
+                    <RefreshCw size={15} className="animate-spin" />
+                  )}
+
+                  {saving ? "Recording..." : "Issue resource"}
                 </button>
               </div>
-
-              <form onSubmit={handleSave} className="space-y-5 p-5 sm:p-6">
-                <div className="grid gap-4 sm:grid-cols-2">
-                  <FormField label="Resource Name" required>
-                    <input
-                      name="name"
-                      value={form.name}
-                      onChange={handleChange}
-                      placeholder="e.g. Electrical cable"
-                      required
-                      className={fieldClass}
-                    />
-                  </FormField>
-
-                  <FormField label="Category" required>
-                    <select
-                      name="category"
-                      value={form.category}
-                      onChange={handleChange}
-                      required
-                      className={fieldClass}
-                    >
-                      {CATEGORIES.map((category) => (
-                        <option key={category} value={category}>
-                          {category}
-                        </option>
-                      ))}
-                    </select>
-                  </FormField>
-
-                  <FormField label="Quantity in Stock" required>
-                    <input
-                      type="number"
-                      name="quantity"
-                      value={form.quantity}
-                      onChange={handleChange}
-                      min="0"
-                      step="any"
-                      placeholder="e.g. 100"
-                      required
-                      className={fieldClass}
-                    />
-                  </FormField>
-
-                  <FormField label="Unit of Measurement" required>
-                    <select
-                      name="unit"
-                      value={form.unit}
-                      onChange={handleChange}
-                      required
-                      className={fieldClass}
-                    >
-                      <option value="pieces">Pieces</option>
-                      <option value="meters">Meters</option>
-                      <option value="rolls">Rolls</option>
-                      <option value="boxes">Boxes</option>
-                      <option value="sets">Sets</option>
-                      <option value="bags">Bags</option>
-                      <option value="liters">Liters</option>
-                      <option value="kilograms">Kilograms</option>
-                      <option value="units">Units</option>
-                    </select>
-                  </FormField>
-
-                  <FormField label="Cost per Unit (GH₵)" required>
-                    <input
-                      type="number"
-                      name="unitCost"
-                      value={form.unitCost}
-                      onChange={handleChange}
-                      min="0"
-                      step="0.01"
-                      placeholder="e.g. 25.00"
-                      required
-                      className={fieldClass}
-                    />
-                  </FormField>
-
-                  <FormField label="Minimum Stock Level" required>
-                    <input
-                      type="number"
-                      name="minStock"
-                      value={form.minStock}
-                      onChange={handleChange}
-                      min="0"
-                      step="any"
-                      placeholder="e.g. 10"
-                      required
-                      className={fieldClass}
-                    />
-                  </FormField>
-
-                  <div className="sm:col-span-2">
-                    <FormField label="Storage Location">
-                      <input
-                        name="location"
-                        value={form.location}
-                        onChange={handleChange}
-                        placeholder="e.g. Main store, warehouse"
-                        className={fieldClass}
-                      />
-                    </FormField>
-                  </div>
-
-                  <div className="sm:col-span-2">
-                    <FormField label="Notes">
-                      <textarea
-                        name="notes"
-                        value={form.notes}
-                        onChange={handleChange}
-                        rows={3}
-                        placeholder="Optional details about this resource..."
-                        className={fieldClass}
-                      />
-                    </FormField>
-                  </div>
-                </div>
-
-                <div className="rounded-xl bg-[#F5F8FC] p-4">
-                  <div className="flex items-center justify-between gap-4">
-                    <span className="text-sm text-[#667085]">
-                      Estimated value of this stock
-                    </span>
-
-                    <span className="text-lg font-bold text-[#1769E0]">
-                      {formatMoney(
-                        (Number(form.quantity) || 0) *
-                          (Number(form.unitCost) || 0)
-                      )}
-                    </span>
-                  </div>
-                </div>
-
-                {error && (
-                  <p role="alert" className="text-sm text-red-600">
-                    {error}
-                  </p>
-                )}
-
-                <div className="flex flex-col-reverse gap-3 border-t border-[#E5EDF5] pt-5 sm:flex-row sm:justify-end">
-                  <button
-                    type="button"
-                    onClick={closeForm}
-                    disabled={saving}
-                    className="rounded-xl border border-[#DCE5EF] px-5 py-3 text-sm font-semibold text-[#475467] hover:bg-gray-50 disabled:opacity-50"
-                  >
-                    Cancel
-                  </button>
-
-                  <button
-                    type="submit"
-                    disabled={saving}
-                    className="inline-flex items-center justify-center gap-2 rounded-xl bg-[#1769E0] px-5 py-3 text-sm font-semibold text-white hover:bg-[#1258BE] disabled:cursor-not-allowed disabled:opacity-60"
-                  >
-                    {saving && (
-                      <Loader2 size={17} className="animate-spin" />
-                    )}
-
-                    {saving
-                      ? "Saving..."
-                      : editingId
-                      ? "Save Changes"
-                      : "Add Resource"}
-                  </button>
-                </div>
-              </form>
-            </div>
+            </form>
           </div>
-        )}
-      </div>
-    </div>
-  );
-}
-
-const fieldClass =
-  "w-full rounded-xl border border-[#DCE5EF] bg-white px-3.5 py-3 text-sm text-[#172033] outline-none transition placeholder:text-gray-400 focus:border-[#1769E0] focus:ring-2 focus:ring-blue-100";
-
-function FormField({ label, required, children }) {
-  return (
-    <label className="block">
-      <span className="mb-2 block text-sm font-medium text-[#344054]">
-        {label}
-        {required && <span className="ml-1 text-red-500">*</span>}
-      </span>
-
-      {children}
-    </label>
-  );
-}
-
-function SummaryCard({
-  title,
-  value,
-  description,
-  icon: Icon,
-  iconClass,
-  compact = false,
-}) {
-  return (
-    <div className="rounded-2xl border border-[#E5EDF5] bg-white p-5 shadow-sm">
-      <div className="flex items-start justify-between gap-3">
-        <div className="min-w-0">
-          <p className="text-sm font-medium text-[#667085]">{title}</p>
-
-          <p
-            className={`mt-3 break-words font-bold tracking-tight text-[#172033] ${
-              compact ? "text-xl sm:text-2xl" : "text-3xl"
-            }`}
-          >
-            {value}
-          </p>
         </div>
-
-        <div className={`shrink-0 rounded-xl p-3 ${iconClass}`}>
-          <Icon size={22} />
-        </div>
-      </div>
-
-      <p className="mt-3 text-xs leading-5 text-[#667085]">
-        {description}
-      </p>
+      )}
     </div>
   );
 }
