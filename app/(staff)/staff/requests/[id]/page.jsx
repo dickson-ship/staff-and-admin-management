@@ -11,7 +11,7 @@ export default function StaffRequestDetails() {
               Loading staff request details...
             </p>
             <p className="mt-1 text-sm text-[#667085]">
-              Please wait while the job is loaded.
+              Please wait while the job is loaded
             </p>
           </div>
         </div>
