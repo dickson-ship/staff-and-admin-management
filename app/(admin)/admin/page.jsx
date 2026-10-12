@@ -526,7 +526,7 @@ export default function AdminDashboardPage() {
           </p>
 
           <h1 className="mt-2 text-2xl font-bold tracking-tight text-[#172033] sm:text-3xl">
-            Welcome back, {firstName}
+            Welcome back, {user?.displayName || "Admin"}
           </h1>
 
           <p className="mt-2 text-sm text-[#667085]">
